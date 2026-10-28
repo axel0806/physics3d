@@ -1,53 +1,87 @@
 # PROGRESS
 
-## Current phase
+## Current status
 
-Phase 2 (shapes + mass properties) — implemented, tests green. Phase reviewer pass pending.
+**Not complete.** Phases 0–3 are done; Phase 4 is nearly done; Phase 5 has all acceptance scenarios
+passing but no `docs/VALIDATION.md` write-up yet. Phases 6–11 are not started. The last full run
+of `pnpm test` (default sample sizes) passed 119 tests across 12 files, and `pnpm check` passed.
 
-## Done
+## Phase status
 
-- **Phase 2 reviewer pass**: independent subagent audit. Findings fixed: (1) polyhedron moments now integrated about a vertex (precision for far-offset hulls); (2) quickhull collinearity test made dimensionless; (3) docs corrected to the code's real tolerance 1e-12·max|coord|. Its adversarial tests are kept (`tests/property/review-phase2.test.ts`). Known open item: `ConvexHull.support` is O(V) per call and hull construction is O(n·F); fine now, revisit in Phase 9.
+- **Phase 0 (scaffolding)**: done. TypeScript pinned to 5.9 (typescript-eslint requires <6.1).
+- **Phase 1 (math)**: done. 39 tests, property tests at 2000 runs, 100% coverage of `src/math`.
+- **Phase 2 (shapes, mass)**: done. Independent reviewer pass completed; findings fixed (vertex-referenced
+  mass moments, dimensionless collinearity test, documented tolerance corrected to 1e-12 × max|coord|).
+  Reviewer's adversarial tests kept as regression tests.
+- **Phase 3 (broadphase)**: done. Fuzz at full size (5,000 AABBs × 1,000 moves, exact pair set each step),
+  height ≤ 2·log₂n, 10,000 rays and 2,000 queries match brute force.
+- **Phase 4 (narrowphase)**: implementation done; acceptance mostly verified.
+  - Default-size tests (1,500 per pair type) pass.
+  - 1,000,000-iteration adversarial fuzz passed (0 non-finite, 0 throws, 0 EPA non-convergence).
+  - **Open:** the full 100,000-configuration accuracy run was started in the background
+    (`NARROWPHASE_SAMPLES=100000`) against the fixed EPA. Its result is not recorded yet. Earlier, a
+    100k run found two real failures (EPA folding, fixed; see below). Re-run `pnpm bench:accuracy` to confirm.
+  - Box-box distance is checked against an independent Minkowski-hull reference on 300 separated samples
+    per run (not 100k: each reference costs a quickhull of 64 points).
+- **Phase 5 (dynamics, solver)**: all eight acceptance scenarios have automated tests and pass.
+  - Free fall (O(dt)); bounce e² within 2% for e ∈ {0.2, 0.5, 0.8} at 1920 Hz; bounce energy drift 6e-4 over 60 s at 1920 Hz (bound 1e-3);
+    momentum 1e-9 and angular momentum 1e-6 over 1,000 random collisions (NGS disabled for this test, see below);
+    Newton's cradle; Dzhanibekov (intermediate axis flips, min/max stable, body-frame); friction ramp
+    (20 angles); 20-box tower (<1 cm, sleeps); 55-box pyramid (stable, sleeps).
+  - **Not yet done:** the `docs/VALIDATION.md` write-up for these tests; and the phase-5 reviewer subagent pass.
 
-- **Phase 3**: `src/collision/broadphase` — DynamicTree (AVL-style rotations, SAH-style branch-and-bound insertion, fat AABBs, closest-hit raycast, AABB query, `validate()`), BroadPhase pair manager (deduplicated pairs, incremental re-query of moved proxies, begin/end events emitted only on real transitions).
-  - Fuzz: 5,000 AABBs × 1,000 moves, pair set equal to brute force at every step (incremental reference per move; full O(n²) recheck every 50 steps). Height ≤ 2·log₂ n after randomized insert/remove over 5 seeds. 10,000 random rays and 2,000 random queries match brute force.
-  - Bugs found by tests and fixed: (1) balance skipped nodes using a stale stored height; (2) one rotation could leave a height gap >1 when a new parent sat above a much taller sibling, now rebalanced recursively; (3) event churn from removing and re-adding unchanged pairs.
+## Known limitations (carry-forward)
 
-- **Phase 0**: pnpm project, TypeScript (pinned 5.9 — typescript-eslint requires <6.1), Vite, Vitest, fast-check, ESLint, Prettier, Playwright. `pnpm verify` green.
-- **Phase 1**: `src/math` — Vec3, Quat, Mat3 (incl. Jacobi `symmetricEigen`), Mat4, Transform, AABB, util.
-  - 39 tests (property tests at 2000 runs each). 100% line/branch/function coverage on `src/math`.
-- **Phase 2**: `src/shapes` — Sphere, Box, Capsule, ConvexHull (Quickhull), TriangleMesh (static), Compound.
-  - Support functions for all convex shapes; mass/COM/inertia for every shape.
-  - Quickhull property tests: inside-or-on, convexity, Euler V−E+F=2 with manifold edges, volume ≤ bbox.
+1. **Near-flat hulls (thickness ratio ≲ 1e-4)**: quickhull can accept a near-duplicate vertex in a
+   near-collinear triangle, which tilts a face ~3e-7 rad. Regression test asserts termination and finiteness
+   only. Planned fix: merge near-duplicates, exact predicates (Phase 4 robustness).
+2. **Exactly touching chains**: Newton's cradle with zero gap at dt = 1/240 gives the wrong answer (balls
+   share momentum inelastically) because restitution is measured from start-of-step velocities and
+   neighbouring pairs have not yet impacted. The test uses 1 mm gaps and dt = 1/2400. Documented.
+3. **Discrete impact energy error**: contacts are found after a step has moved bodies by v·dt, so bounce
+   error is first order in dt (4.9e-3 at 240 Hz, 6.1e-4 at 1920 Hz). Speculative contacts or CCD (Phase 7) would remove it.
+4. **Angular momentum with position correction**: NGS moves bodies, which changes Σ x×mv. The
+   momentum test therefore runs with `positionIterations: 0`, so only velocity-level impulses are checked.
+5. **Iteration count**: default velocity iterations are now 40. Ten iterations were insufficient for a
+   55-box pyramid (stable at 40, not at 20). Phase 9 must budget for this.
+6. **Hull support** is O(V) per call and hull construction is O(n·F). Fine for now; revisit in Phase 9.
+7. **Friction**: stacking stability depends on friction (frictionless stacks topple), which is physical.
 
-## Failing
+## Bugs found and fixed during this work (for the record)
 
-- none (all 66 tests green; property suites run with fresh random seeds each run — 4 stability runs green after the fixes below)
-
-## Known limitations (carried into Phase 4)
-
-- **Near-flat hulls (thickness ratio ≲ 1e-4)**: quickhull can accept a near-duplicate vertex in a near-collinear triangle. The resulting face tilts by ~3e-7 rad, so a far vertex ends up ~3e-6 outside it. Root cause: tolerance-based visibility is inconsistent with the new face's plane at that geometry. Regression test `a near-flat cloud … (KNOWN LIMITATION)` asserts termination and finiteness only. Planned fix (Phase 4 adversarial work): merge near-duplicate input points before hulling, and/or exact orientation predicates. Property tests exclude these hulls via the well-conditioned precondition below.
-
-## Next
-
-- Phase 2 reviewer subagent pass (per plan), then Phase 3 (dynamic AABB tree).
-
-## Phase 4 status
-
-- GJK: closest point by enumerating simplex subsets (exact, degeneracy-robust). Overlap is declared only with an EPA-ready simplex; if the origin lands on a lower-dimensional simplex, GJK restarts from generic directions. (Center-aligned sphere pairs otherwise always hit this.)
-- EPA: van den Bergen expansion with tolerance 1e-6·scale and 128-iteration cap; typical sphere pairs need ~66 iterations because EPA converges linearly on curved shapes. Results report `converged`.
-- Measured at default sample sizes (1500 per pair type): sphere-sphere depth error < 1e-4, normal < 0.5° (worst measured ~0.1°), distance < 1e-6; sphere-box analytic vs GJK depth < 1e-4; box-box manifold vs independent Minkowski-hull reference: depth ~1e-10 typical.
-- Box-box reference: convex hull of the 64 pairwise vertex differences (exact Minkowski difference), built with the Phase 2 quickhull. This is independent of both SAT and EPA.
-- Manifolds: reduce to 4 points (deepest, farthest, max triangle, far from diagonal). Feature ids are geometry-derived and persist across frames.
-- **Pending for Phase 4 acceptance**: full 100,000-configuration accuracy run (`pnpm bench:accuracy`, est. ~12 min per pair type) and 1,000,000-iteration adversarial fuzz (`pnpm fuzz:narrowphase`). Results are recorded below once they finish.
+- Quickhull: orphan points reassigned to new faces only (lost points); degenerate-simplex test used a
+  normalized normal (noise amplified). Both fixed.
+- EPA: visibility tolerance too loose (1e-6); polytope folded after ~130 splits on rounded shapes
+  (sphere-box normal 1° off; sphere-sphere depth error 0.75 at 100k). Fixed by tight visibility (1e-12).
+- Anchors: body-frame anchor applied the inverse rotation twice (wrong face corners on tilted bodies).
+- Angular momentum: impulses at different points on the two surfaces (now midpoint); world inertia
+  uninitialized until the first step (now at mass setup); frame mismatch from rotating after the solve
+  (orientation now updated before the contact solve).
+- Gyroscopic integration: world-frame frozen inertia leaked L at O(dt); now body-frame implicit midpoint
+  with an exact pose update (|L| and E conserved to 1e-11 in free motion; matches RK4 Euler reference).
+- Restitution: used post-gravity velocity, adding g·dt per bounce. Now start-of-step.
+- Restitution threshold: impacts at exactly the threshold speed were skipped (`<` vs `≤`); tests use speeds above it.
+- Manifold clipping ids flipped with rounding; clipping now tolerant, SAT ties favour faces.
+- Coplanar four-point normal matrix is singular; 1e-9 Tikhonov term selects the symmetric solution.
+- Sequential normal/friction interleaving let friction saturate at one corner and pitch the body.
+  Now: block normal LCP (active-set), then friction.
+- Position correction: rotational pushes toppled tall stacks; now linear only. Slop 0.2 mm (4 mm sag over 20 boxes).
+- Waking on every persisting contact reset the sleep timer; now only new contacts wake.
+- Friction test placed boxes inside the ramp, and the Dzhanibekov test mis-detected flips in world frame.
+  Both are test bugs, fixed.
 
 ## Design decisions
 
-- **Polyhedral mass properties (Phase 2)**: `polyhedronMassProperties` integrates each oriented triangle against the origin (signed tetrahedra) using the exact simplex moment identities ∫x_i x_j dV = V/20·(Σ_k p_ki p_kj + Σ_k p_ki Σ_l p_lj). This is exact, the same polynomial integrals that Mirtich's projection method computes, and it is verified against analytic box inertia to 1e-9. **Deviation:** the plan names Mirtich's method; I used the tetrahedral form because it is a closed-form identity that I could check directly. Revisit only if profiling shows it matters.
-- **Compounds**: parallel-axis theorem via `combine()`; children are re-expressed in the parent frame with `transformMassProperties`.
-- **Capsule**: cylinder + two hemispheres. A hemisphere's inertia about its COM is (2/5 − 9/64)·m_h·r² transverse, 2/5·m_h·r² axial, with COM 3r/8 from its flat face (verified in the test against the derivation).
-- **Quickhull tolerance**: `tol = 1e-12 · max|coord|` (the value in code; an earlier draft of this note said 1e-8 and was wrong). Points within `tol` of the hull are dropped, so the hull is within `tol` of every input point by construction. Two bugs were found and fixed while testing:
-  1. Orphaned outside points were reassigned only to _new_ faces. A point can lie beyond an old, non-visible face and then be lost, so orphans are now reassigned against every live face.
-  2. The initial-simplex "coplanar" test used the distance to a normalized normal. For nearly parallel edges the normal's direction error (~ε·|e|²/|e1×e2|) can exceed the distance tolerance, so a duplicate point looked non-coplanar. The test now uses the scaled determinant |det(e1,e2,e3)|/(|e1||e2||e3|) > 1e-9.
-- **Property-test tolerances**: the "inside" and "convex" checks use `2e-8 · scale`, which is 2× the hull's own tolerance. The factor of 2 absorbs rounding for points exactly at the drop threshold; it is not a loosening of the algorithm's guarantee. Those checks use only hulls with volume > 1e-6 · bbox³ and only triangles with cross-product length ≥ 1e-4, because a sliver's normal has rounding error ≈ ε·scale²/area, which is ~1e-9 at area 1e-4 and dominates for smaller slivers. Flatter hulls are exercised by the Phase 4 adversarial thin-shape tests.
-- **Quickhull complexity**: O(n·F) for orphan reassignment (scans live faces). Acceptable at Phase 2; revisit if Phase 9 benchmarks need it (the 100k-triangle terrain uses TriangleMesh, which does not build a hull).
-- **Tooling note**: the vitest runs must be launched in the background with a bounded wait, since a full run plus property tests exceeds the foreground 120 s limit.
+See `docs/ARCHITECTURE.md` (pipeline, solver, position correction, gyroscopic integration, tradeoffs).
+
+## Next steps (in order)
+
+1. Record the 100k narrowphase accuracy result in this file (`pnpm bench:accuracy`).
+2. Write `docs/VALIDATION.md` for the Phase 4 and Phase 5 tests (setup, expected, measured).
+3. Phase 5 reviewer subagent (per plan), then fix findings.
+4. Phase 6: joints (ball, hinge with limits and motor, slider, fixed, distance, cone-twist).
+5. Phases 7–11 as planned in `PLAN.md`.
+
+## Uncommitted state
+
+The Phase 5 work is committed (`af9b81f`). Edits after that (none significant) are not committed.
