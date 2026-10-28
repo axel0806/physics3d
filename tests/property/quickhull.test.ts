@@ -13,7 +13,7 @@ const cloud = fc.array(
 const RUNS = { numRuns: 1000 };
 const SCALE = 10;
 /**
- * "On or inside" tolerance. quickhull drops points within its own tolerance (1e-8 × max |coord|),
+ * "On or inside" tolerance. quickhull drops points within its own tolerance (1e-12 × max |coord|),
  * so the check allows 2× that to absorb rounding at the boundary.
  */
 const TOL = 2e-8 * SCALE;

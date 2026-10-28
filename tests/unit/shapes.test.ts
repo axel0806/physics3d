@@ -209,7 +209,7 @@ describe('quickhull regressions (inputs found by property testing)', () => {
       new Vec3(-0.0030038239711335096, 3.0953595142937718, 1.0027119454693854),
       new Vec3(0, 0, 0),
     ];
-    expect(() => quickhull(pts)).toThrow(/coplanar/);
+    expect(() => quickhull(pts)).toThrow(/degenerate hull/);
   });
   it('rejects a flat simplex whose height is below the rounding floor', () => {
     const pts = [

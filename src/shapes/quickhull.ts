@@ -164,8 +164,8 @@ function initialSimplex(
       i2 = i;
     }
   }
-  if (!(Math.sqrt(d2) / Math.sqrt(best) > 1e-10))
-    throw new RangeError('degenerate hull: collinear points');
+  // |ap×ab| = dist·|ab|, so dist/|ab| = sqrt(d2)/best: a dimensionless ratio, scale-invariant.
+  if (!(Math.sqrt(d2) / best > 1e-10)) throw new RangeError('degenerate hull: collinear points');
   const c = pts[i2] as Vec3;
   // Fourth point maximizes |det(e1, e2, e3)|, i.e. its distance from the base plane (scaled by
   // |e1 × e2|). Height is measured relative to the diameter |e1|, so it is scale-invariant and

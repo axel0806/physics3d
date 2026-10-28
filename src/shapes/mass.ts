@@ -73,6 +73,24 @@ export function diagonalInertia(x: number, y: number, z: number): Mat3 {
  * first and second moments, which are then shifted to the centroid.
  */
 export function polyhedronMassProperties(
+  verticesIn: readonly Vec3[],
+  indices: ArrayLike<number>,
+  density: number,
+): MassProperties {
+  // Integrate about the first vertex rather than the origin: moments about a point near the body
+  // avoid cancellation when the body sits far from the origin. The result is shifted back.
+  const ref = verticesIn[0] ?? new Vec3();
+  const vertices = verticesIn.map((v) => new Vec3(v.x - ref.x, v.y - ref.y, v.z - ref.z));
+  const local = integratePolyhedron(vertices, indices, density);
+  const com = new Vec3(
+    local.centerOfMass.x + ref.x,
+    local.centerOfMass.y + ref.y,
+    local.centerOfMass.z + ref.z,
+  );
+  return { mass: local.mass, centerOfMass: com, inertia: local.inertia };
+}
+
+function integratePolyhedron(
   vertices: readonly Vec3[],
   indices: ArrayLike<number>,
   density: number,

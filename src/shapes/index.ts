@@ -6,6 +6,7 @@ export * from './capsule';
 export * from './hull';
 export * from './quickhull';
 export * from './mesh';
+export * from './triangle';
 export * from './compound';
 
 import type { Sphere } from './sphere';
