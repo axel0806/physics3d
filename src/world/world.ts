@@ -184,24 +184,28 @@ export class World {
     for (const body of this.bodies)
       if (body.jointCount > 0) integrateOrientationPostSolve(body, dt);
     for (const body of this.bodies) integratePosition(body, dt);
+    const feedback = new Map<RigidBody, [Vec3, Vec3]>();
     for (let it = 0; it < this.positionIterations; it++) {
       for (const c of this.contacts.values()) {
         if (this.constraintActive(c)) solvePosition(c, this.baumgarte, this.linearSlop);
       }
-      for (const j of this.joints) if (j.active) this.correctJoint(j, dt);
+      for (const j of this.joints) if (j.active) j.solveLimits();
+      for (const j of this.joints) if (j.active) this.correctJoint(j, feedback);
     }
+    this.applyFeedback(feedback, dt);
     for (const body of this.bodies) body.updateWorldInertia();
     this.updateSleep(dt);
     this.frame++;
   }
 
   /**
-   * One NGS pass over a joint. The displacement it applies is also fed back into the velocities
-   * (as in SHAKE): the position step moved the body along the tangent, the correction is the
-   * missing centripetal part, and without it every step dissipates energy at first order in dt.
-   * The feedback is capped so a badly violated joint is pulled in gently rather than kicked.
+   * One NGS pass over a joint's equality locks. The displacement it applies is accumulated per
+   * body and fed back into the velocities once per step (as in SHAKE): the position step moved the
+   * body along the tangent, the correction is the missing centripetal part, and without it every
+   * step dissipates energy at first order in dt. The total is capped per body so a badly violated
+   * joint is pulled in gently rather than kicked.
    */
-  private correctJoint(j: Joint, dt: number): void {
+  private correctJoint(j: Joint, feedback: Map<RigidBody, [Vec3, Vec3]>): void {
     const a = j.bodyA;
     const b = j.bodyB;
     const pa = V.copy(new Vec3(), a.position);
@@ -209,24 +213,41 @@ export class World {
     const qa = a.orientation.clone();
     const qb = b.orientation.clone();
     j.solvePosition();
-    this.feedback(a, pa, qa, dt);
-    this.feedback(b, pb, qb, dt);
+    this.accumulate(a, pa, qa, feedback);
+    this.accumulate(b, pb, qb, feedback);
   }
 
-  private feedback(body: RigidBody, p0: Vec3, q0: Quat, dt: number): void {
+  private accumulate(
+    body: RigidBody,
+    p0: Vec3,
+    q0: Quat,
+    feedback: Map<RigidBody, [Vec3, Vec3]>,
+  ): void {
     if (!body.isSimulated) return;
-    const dv = V.sub(new Vec3(), body.position, p0);
-    V.scale(dv, dv, 1 / dt);
-    const dvLen = V.length(dv);
-    if (dvLen > this.maxCorrectionSpeed) V.scale(dv, dv, this.maxCorrectionSpeed / dvLen);
-    V.add(body.linearVelocity, body.linearVelocity, dv);
-    // World-frame rotation taking q0 to the current orientation.
+    let acc = feedback.get(body);
+    if (!acc) {
+      acc = [new Vec3(), new Vec3()];
+      feedback.set(body, acc);
+    }
+    V.add(acc[0], acc[0], V.sub(new Vec3(), body.position, p0));
+    // World-frame rotation vector taking q0 to the current orientation.
     const dq = Q.mul(new Quat(), body.orientation, Q.invert(new Quat(), q0));
-    const k = dq.w < 0 ? -2 / dt : 2 / dt;
-    const dw = new Vec3(dq.x * k, dq.y * k, dq.z * k);
-    const dwLen = V.length(dw);
-    if (dwLen > this.maxCorrectionSpeed) V.scale(dw, dw, this.maxCorrectionSpeed / dwLen);
-    V.add(body.angularVelocity, body.angularVelocity, dw);
+    const k = dq.w < 0 ? -2 : 2;
+    V.add(acc[1], acc[1], new Vec3(dq.x * k, dq.y * k, dq.z * k));
+  }
+
+  private applyFeedback(feedback: Map<RigidBody, [Vec3, Vec3]>, dt: number): void {
+    for (const [body, [dx, dtheta]] of feedback) {
+      for (const [target, delta] of [
+        [body.linearVelocity, dx],
+        [body.angularVelocity, dtheta],
+      ] as const) {
+        const dv = V.scale(new Vec3(), delta, 1 / dt);
+        const len = V.length(dv);
+        if (len > this.maxCorrectionSpeed) V.scale(dv, dv, this.maxCorrectionSpeed / len);
+        V.add(target, target, dv);
+      }
+    }
   }
 
   private constraintActive(c: ContactConstraint): boolean {

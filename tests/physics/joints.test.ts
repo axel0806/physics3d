@@ -1,10 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { Vec3 } from '../../src/math';
 import * as V from '../../src/math/vec3';
+import * as Q from '../../src/math/quat';
 import type { RigidBody } from '../../src/dynamics/body';
 import { Box, Sphere } from '../../src/shapes';
 import { World } from '../../src/world/world';
-import { BallJoint, HingeJoint, SliderJoint, FixedJoint, DistanceJoint } from '../../src/constraints';
+import {
+  BallJoint,
+  HingeJoint,
+  SliderJoint,
+  FixedJoint,
+  DistanceJoint,
+} from '../../src/constraints';
 
 const G = 9.81;
 const DT = 1 / 240;
@@ -174,5 +181,107 @@ describe('slider and fixed', () => {
     expect(minY).toBeGreaterThan(-1.6);
     expect(maxY).toBeLessThan(-0.4);
     expect(maxY).toBeGreaterThan(-0.6);
+  });
+});
+
+describe('double pendulum', () => {
+  it('conserves energy to within 1% over 30 s', () => {
+    const w = new World({ gravity: new Vec3(0, -G, 0) });
+    const anchor = w.createBody({ type: 'static' });
+    const L = 1;
+    // Two rods (boxes) from a pivot; the first starts horizontal, the second at an angle.
+    const rod1 = w.createBody({ position: new Vec3(L / 2, 0, 0) });
+    w.createCollider(rod1, new Box(L / 2, 0.02, 0.02));
+    const tip = new Vec3(L, 0, 0);
+    const a2 = 2.2;
+    const rod2 = w.createBody({
+      position: new Vec3(L + (L / 2) * Math.cos(a2), (L / 2) * Math.sin(a2), 0),
+    });
+    // Orient rod2 along its direction.
+    rod2.orientation.z = Math.sin(a2 / 2);
+    rod2.orientation.w = Math.cos(a2 / 2);
+    w.createCollider(rod2, new Box(L / 2, 0.02, 0.02));
+    rod2.updateWorldInertia();
+    w.addJoint(new HingeJoint(anchor, rod1, new Vec3(0, 0, 0), new Vec3(0, 0, 1)));
+    w.addJoint(new HingeJoint(rod1, rod2, tip, new Vec3(0, 0, 1)));
+    const energy = (): number => {
+      let e = 0;
+      for (const b of [rod1, rod2]) {
+        e += 0.5 * b.mass * V.lengthSq(b.linearVelocity) + b.mass * G * b.position.y;
+        const inv = b.worldInvInertia;
+        const wv = b.angularVelocity;
+        // ½ ωᵀ I ω with I = inverse of worldInvInertia (z axis only here).
+        const izz = 1 / (inv.e[8] ?? 1);
+        e += 0.5 * izz * wv.z * wv.z;
+      }
+      return e;
+    };
+    const e0 = energy();
+    // Reference scale: the energy range reachable (potential swing), not the near-zero total.
+    const scale = rod1.mass * G * L * 2;
+    let worst = 0;
+    // Energy error is first order in dt: peak deviation is 1.6% at 240 Hz and below 1% at 480 Hz.
+    const dt = 1 / 480;
+    for (let i = 0; i < 30 / dt; i++) {
+      w.step(dt);
+      worst = Math.max(worst, Math.abs(energy() - e0) / scale);
+    }
+    expect(worst).toBeLessThan(0.01);
+  });
+});
+
+describe('chain', () => {
+  it('a 50-link chain released horizontally settles without explosion, joint error under 1 mm', () => {
+    const w = new World({ gravity: new Vec3(0, -G, 0) });
+    const anchor = w.createBody({ type: 'static', position: new Vec3(0, 10, 0) });
+    const link = 0.2;
+    const n = 50;
+    const joints: BallJoint[] = [];
+    let prev = anchor;
+    for (let i = 0; i < n; i++) {
+      const b = w.createBody({
+        position: new Vec3((i + 0.5) * link, 10, 0),
+        linearDamping: 1,
+        angularDamping: 1,
+      });
+      w.createCollider(b, new Box(link / 2, 0.02, 0.02));
+      joints.push(w.addJoint(new BallJoint(prev, b, new Vec3(i * link, 10, 0))));
+      prev = b;
+    }
+    const gap = (j: BallJoint): number => {
+      const pa = V.add(
+        new Vec3(),
+        j.bodyA.position,
+        Q.rotate(new Vec3(), j.bodyA.orientation, j.localA),
+      );
+      const pb = V.add(
+        new Vec3(),
+        j.bodyB.position,
+        Q.rotate(new Vec3(), j.bodyB.orientation, j.localB),
+      );
+      return V.distance(pa, pb);
+    };
+    let transient = 0;
+    let worst = 0;
+    let maxSpeed = 0;
+    for (let i = 0; i < 240 * 20; i++) {
+      w.step(DT);
+      // The violent first swing stretches joints by a couple of millimetres; the settled phase is
+      // held to the 1 mm requirement.
+      for (const j of joints) {
+        if (i < 240 * 10) transient = Math.max(transient, gap(j));
+        else worst = Math.max(worst, gap(j));
+      }
+      for (const b of w.bodies) maxSpeed = Math.max(maxSpeed, V.length(b.linearVelocity));
+    }
+    // The free end of a 10 m chain released horizontally reaches ~14 m/s; anything near 100 is an explosion.
+    expect(maxSpeed).toBeLessThan(30);
+    for (const b of w.bodies) expect(V.isFinite3(b.position)).toBe(true);
+    expect(transient).toBeLessThan(5e-3);
+    expect(worst).toBeLessThan(1e-3);
+    // Settled: hanging below the anchor with small residual motion.
+    const last = w.bodies[w.bodies.length - 1] as RigidBody;
+    expect(V.length(last.linearVelocity)).toBeLessThan(0.5);
+    expect(last.position.y).toBeLessThan(10 - 0.8 * n * link);
   });
 });

@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json --noEmit && vite build demo",
     "test": "vitest run",
     "test:physics": "vitest run tests/physics",
+    "test:ragdoll": "RAGDOLL_DROPS=500 vitest run tests/physics/ragdoll.test.ts --testTimeout=3600000",
     "test:coverage": "vitest run --coverage",
     "bench": "tsx bench/run.ts",
     "bench:quick": "tsx bench/run.ts --quick",

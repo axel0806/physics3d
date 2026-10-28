@@ -299,6 +299,16 @@ export abstract class Joint {
   abstract prepare(dt: number): void;
   abstract warmStart(): void;
   abstract solveVelocity(dt: number): void;
-  /** One NGS iteration; returns the largest remaining position error. */
+  /**
+   * One NGS iteration over the equality locks (anchors, axes); returns the largest position error
+   * before the correction. The world feeds the displacement back into the velocities (SHAKE).
+   */
   abstract solvePosition(): number;
+  /**
+   * One NGS iteration over inequality limits. Not fed back into velocities: that would turn every
+   * correction into a bounce. Runs before `solvePosition` so locks clean up what it disturbs.
+   */
+  solveLimits(): number {
+    return 0;
+  }
 }

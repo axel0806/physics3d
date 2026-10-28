@@ -215,6 +215,14 @@ export class HingeJoint extends Joint {
     this.perp1.position(a, b, c1, BETA());
     this.perp2.position(a, b, c2, BETA());
     worst = Math.max(worst, Math.abs(c1), Math.abs(c2));
+    worst = Math.max(worst, this.point.position(a, b, this.localA, this.localB, BETA()));
+    return worst;
+  }
+
+  override solveLimits(): number {
+    const a = this.bodyA;
+    const b = this.bodyB;
+    let worst = 0;
     if (this.enableLimit) {
       const theta = this.measureAngle();
       const axis = worldDir(a, this.axisA);
@@ -230,7 +238,6 @@ export class HingeJoint extends Joint {
       }
       worst = Math.max(worst, -low, -high);
     }
-    worst = Math.max(worst, this.point.position(a, b, this.localA, this.localB, BETA()));
     return worst;
   }
 }
@@ -379,6 +386,13 @@ export class SliderJoint extends Joint {
     this.perp1.position(a, b, c1, BETA());
     this.perp2.position(a, b, c2, BETA());
     worst = Math.max(worst, Math.abs(c1), Math.abs(c2));
+    return worst;
+  }
+
+  override solveLimits(): number {
+    const a = this.bodyA;
+    const b = this.bodyB;
+    let worst = 0;
     if (this.enableLimit) {
       const g = this.frame();
       const s = V.dot(g.d, g.axis);
@@ -597,6 +611,10 @@ export class ConeTwistJoint extends Joint {
   }
 
   solvePosition(): number {
+    return this.point.position(this.bodyA, this.bodyB, this.localA, this.localB, BETA());
+  }
+
+  override solveLimits(): number {
     const a = this.bodyA;
     const b = this.bodyB;
     const s = this.state();
@@ -620,7 +638,7 @@ export class ConeTwistJoint extends Joint {
       this.twistHigh.position(a, b, ch, BETA());
       worst = Math.max(worst, -ch);
     }
-    return Math.max(worst, this.point.position(a, b, this.localA, this.localB, BETA()));
+    return worst;
   }
 }
 
