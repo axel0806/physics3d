@@ -16,7 +16,9 @@
     "bench:alloc": "node --expose-gc --import tsx bench/alloc.ts",
     "check": "tsc -p tsconfig.json --noEmit && eslint . && prettier --check .",
     "format": "prettier --write .",
-    "verify": "pnpm check && pnpm test && pnpm bench:quick"
+    "verify": "pnpm check && pnpm test && pnpm bench:quick",
+    "bench:accuracy": "NARROWPHASE_SAMPLES=100000 vitest run tests/property/narrowphase.test.ts",
+    "fuzz:narrowphase": "tsx bench/fuzz-narrowphase.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

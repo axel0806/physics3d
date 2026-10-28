@@ -6,6 +6,8 @@ Phase 2 (shapes + mass properties) — implemented, tests green. Phase reviewer 
 
 ## Done
 
+- **Phase 2 reviewer pass**: independent subagent audit. Findings fixed: (1) polyhedron moments now integrated about a vertex (precision for far-offset hulls); (2) quickhull collinearity test made dimensionless; (3) docs corrected to the code's real tolerance 1e-12·max|coord|. Its adversarial tests are kept (`tests/property/review-phase2.test.ts`). Known open item: `ConvexHull.support` is O(V) per call and hull construction is O(n·F); fine now, revisit in Phase 9.
+
 - **Phase 3**: `src/collision/broadphase` — DynamicTree (AVL-style rotations, SAH-style branch-and-bound insertion, fat AABBs, closest-hit raycast, AABB query, `validate()`), BroadPhase pair manager (deduplicated pairs, incremental re-query of moved proxies, begin/end events emitted only on real transitions).
   - Fuzz: 5,000 AABBs × 1,000 moves, pair set equal to brute force at every step (incremental reference per move; full O(n²) recheck every 50 steps). Height ≤ 2·log₂ n after randomized insert/remove over 5 seeds. 10,000 random rays and 2,000 random queries match brute force.
   - Bugs found by tests and fixed: (1) balance skipped nodes using a stale stored height; (2) one rotation could leave a height gap >1 when a new parent sat above a much taller sibling, now rebalanced recursively; (3) event churn from removing and re-adding unchanged pairs.
@@ -28,6 +30,15 @@ Phase 2 (shapes + mass properties) — implemented, tests green. Phase reviewer 
 ## Next
 
 - Phase 2 reviewer subagent pass (per plan), then Phase 3 (dynamic AABB tree).
+
+## Phase 4 status
+
+- GJK: closest point by enumerating simplex subsets (exact, degeneracy-robust). Overlap is declared only with an EPA-ready simplex; if the origin lands on a lower-dimensional simplex, GJK restarts from generic directions. (Center-aligned sphere pairs otherwise always hit this.)
+- EPA: van den Bergen expansion with tolerance 1e-6·scale and 128-iteration cap; typical sphere pairs need ~66 iterations because EPA converges linearly on curved shapes. Results report `converged`.
+- Measured at default sample sizes (1500 per pair type): sphere-sphere depth error < 1e-4, normal < 0.5° (worst measured ~0.1°), distance < 1e-6; sphere-box analytic vs GJK depth < 1e-4; box-box manifold vs independent Minkowski-hull reference: depth ~1e-10 typical.
+- Box-box reference: convex hull of the 64 pairwise vertex differences (exact Minkowski difference), built with the Phase 2 quickhull. This is independent of both SAT and EPA.
+- Manifolds: reduce to 4 points (deepest, farthest, max triangle, far from diagonal). Feature ids are geometry-derived and persist across frames.
+- **Pending for Phase 4 acceptance**: full 100,000-configuration accuracy run (`pnpm bench:accuracy`, est. ~12 min per pair type) and 1,000,000-iteration adversarial fuzz (`pnpm fuzz:narrowphase`). Results are recorded below once they finish.
 
 ## Design decisions
 
