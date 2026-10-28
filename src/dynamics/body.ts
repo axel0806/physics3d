@@ -61,6 +61,8 @@ export class RigidBody {
   /** Velocities at the start of the step, before gravity and contacts; restitution uses these. */
   readonly stepStartLinear: Vec3 = new Vec3();
   readonly stepStartAngular: Vec3 = new Vec3();
+  /** Number of joints attached; jointed bodies rotate after the constraint solve. */
+  jointCount = 0;
   /** Sleep bookkeeping. */
   awake = true;
   sleepTime = 0;

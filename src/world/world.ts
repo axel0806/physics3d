@@ -1,4 +1,4 @@
-import { AABB, Transform, Vec3 } from '../math';
+import { AABB, Quat, Transform, Vec3 } from '../math';
 import * as V from '../math/vec3';
 import * as BB from '../math/aabb';
 import * as T from '../math/transform';
@@ -7,10 +7,12 @@ import { RigidBody, type BodyOptions, type Collider } from '../dynamics/body';
 import {
   integratePosition,
   integrateOrientation,
+  integrateOrientationPostSolve,
   integrateVelocities,
 } from '../dynamics/integrate';
 import type { ConvexShape } from '../shapes/shape';
 import { BroadPhase, pairKey } from '../collision/broadphase';
+import { Joint } from '../constraints/joint';
 import { manifoldOf } from '../collision/pairs';
 import {
   buildNormalK,
@@ -60,6 +62,7 @@ export class World {
   readonly gravity: Vec3;
   readonly bodies: RigidBody[] = [];
   readonly colliders: Collider[] = [];
+  readonly joints: Joint[] = [];
   readonly broadphase = new BroadPhase(0.1);
   velocityIterations: number;
   positionIterations: number;
@@ -67,11 +70,14 @@ export class World {
   baumgarte: number;
   linearSlop: number;
   sleepTimeLimit: number;
+  /** Largest velocity (m/s or rad/s) that one joint position correction may feed back. */
+  maxCorrectionSpeed = 1;
   /** Frames stepped so far. */
   frame = 0;
   private readonly contacts = new Map<number, ContactConstraint>();
   private readonly colliderProxy = new Map<Collider, number>();
   private readonly proxyCollider = new Map<number, Collider>();
+  private readonly jointedPairs = new Set<number>();
   private nextBodyId = 1;
   private readonly listeners: ((e: ContactEvent) => void)[] = [];
 
@@ -111,6 +117,27 @@ export class World {
     return c;
   }
 
+  /** Registers a joint. Unless `collideConnected`, its two bodies stop colliding with each other. */
+  addJoint<J extends Joint>(joint: J): J {
+    this.joints.push(joint);
+    joint.bodyA.jointCount++;
+    joint.bodyB.jointCount++;
+    if (!joint.collideConnected) this.jointedPairs.add(bodyPairKey(joint.bodyA, joint.bodyB));
+    return joint;
+  }
+
+  removeJoint(joint: Joint): void {
+    const i = this.joints.indexOf(joint);
+    if (i < 0) return;
+    this.joints.splice(i, 1);
+    joint.bodyA.jointCount--;
+    joint.bodyB.jointCount--;
+    this.jointedPairs.clear();
+    for (const j of this.joints) {
+      if (!j.collideConnected) this.jointedPairs.add(bodyPairKey(j.bodyA, j.bodyB));
+    }
+  }
+
   onContact(listener: (e: ContactEvent) => void): void {
     this.listeners.push(listener);
   }
@@ -126,10 +153,21 @@ export class World {
     for (const body of this.bodies) body.snapshotVelocities();
     this.updateBroadphase(dt);
     this.updateContacts();
+    for (const j of this.joints) {
+      if (j.bodyA.awake !== j.bodyB.awake && j.bodyA.isDynamic && j.bodyB.isDynamic) {
+        j.bodyA.wake();
+        j.bodyB.wake();
+      }
+    }
     for (const body of this.bodies) {
       if (!body.isSimulated) continue;
       integrateVelocities(body, this.gravity, dt);
-      integrateOrientation(body, dt);
+      if (body.jointCount === 0) integrateOrientation(body, dt);
+    }
+    for (const j of this.joints) {
+      if (!j.active) continue;
+      j.prepare(dt);
+      j.warmStart();
     }
     for (const c of this.contacts.values()) {
       if (!this.constraintActive(c)) continue;
@@ -138,17 +176,57 @@ export class World {
       warmStart(c);
     }
     for (let it = 0; it < this.velocityIterations; it++) {
+      for (const j of this.joints) if (j.active) j.solveVelocity(dt);
       for (const c of this.contacts.values()) if (this.constraintActive(c)) solveVelocity(c);
     }
+    // Jointed bodies rotate after the solve, from the same pose the joints were evaluated at;
+    // free bodies were rotated before it (see integrateOrientation).
+    for (const body of this.bodies)
+      if (body.jointCount > 0) integrateOrientationPostSolve(body, dt);
     for (const body of this.bodies) integratePosition(body, dt);
     for (let it = 0; it < this.positionIterations; it++) {
       for (const c of this.contacts.values()) {
         if (this.constraintActive(c)) solvePosition(c, this.baumgarte, this.linearSlop);
       }
+      for (const j of this.joints) if (j.active) this.correctJoint(j, dt);
     }
     for (const body of this.bodies) body.updateWorldInertia();
     this.updateSleep(dt);
     this.frame++;
+  }
+
+  /**
+   * One NGS pass over a joint. The displacement it applies is also fed back into the velocities
+   * (as in SHAKE): the position step moved the body along the tangent, the correction is the
+   * missing centripetal part, and without it every step dissipates energy at first order in dt.
+   * The feedback is capped so a badly violated joint is pulled in gently rather than kicked.
+   */
+  private correctJoint(j: Joint, dt: number): void {
+    const a = j.bodyA;
+    const b = j.bodyB;
+    const pa = V.copy(new Vec3(), a.position);
+    const pb = V.copy(new Vec3(), b.position);
+    const qa = a.orientation.clone();
+    const qb = b.orientation.clone();
+    j.solvePosition();
+    this.feedback(a, pa, qa, dt);
+    this.feedback(b, pb, qb, dt);
+  }
+
+  private feedback(body: RigidBody, p0: Vec3, q0: Quat, dt: number): void {
+    if (!body.isSimulated) return;
+    const dv = V.sub(new Vec3(), body.position, p0);
+    V.scale(dv, dv, 1 / dt);
+    const dvLen = V.length(dv);
+    if (dvLen > this.maxCorrectionSpeed) V.scale(dv, dv, this.maxCorrectionSpeed / dvLen);
+    V.add(body.linearVelocity, body.linearVelocity, dv);
+    // World-frame rotation taking q0 to the current orientation.
+    const dq = Q.mul(new Quat(), body.orientation, Q.invert(new Quat(), q0));
+    const k = dq.w < 0 ? -2 / dt : 2 / dt;
+    const dw = new Vec3(dq.x * k, dq.y * k, dq.z * k);
+    const dwLen = V.length(dw);
+    if (dwLen > this.maxCorrectionSpeed) V.scale(dw, dw, this.maxCorrectionSpeed / dwLen);
+    V.add(body.angularVelocity, body.angularVelocity, dw);
   }
 
   private constraintActive(c: ContactConstraint): boolean {
@@ -196,7 +274,10 @@ export class World {
       const ca = this.proxyCollider.get(ia);
       const cb = this.proxyCollider.get(ib);
       if (!ca || !cb) continue;
-      if (!this.shouldCollide(ca, cb)) continue;
+      if (!this.shouldCollide(ca, cb)) {
+        this.contacts.delete(key);
+        continue;
+      }
       this.refreshPair(key, ca, cb);
     }
   }
@@ -207,6 +288,7 @@ export class World {
 
   private shouldCollide(a: Collider, b: Collider): boolean {
     if (a.body === b.body) return false;
+    if (this.jointedPairs.has(bodyPairKey(a.body, b.body))) return false;
     if (!(a.body.isSimulated || b.body.isSimulated)) return false;
     if ((a.mask & b.layer) === 0 || (b.mask & a.layer) === 0) return false;
     return true;
@@ -277,11 +359,16 @@ export class World {
       return r;
     };
     for (const body of this.bodies) parent.set(body, body);
-    for (const c of this.contacts.values()) {
-      const ra = find(c.bodyA);
-      const rb = find(c.bodyB);
+    // Islands connect through dynamic bodies only: a shared static floor or anchor must not merge
+    // unrelated groups.
+    const link = (a: RigidBody, b: RigidBody): void => {
+      if (!a.isDynamic || !b.isDynamic) return;
+      const ra = find(a);
+      const rb = find(b);
       if (ra !== rb) parent.set(ra, rb);
-    }
+    };
+    for (const c of this.contacts.values()) link(c.bodyA, c.bodyB);
+    for (const j of this.joints) link(j.bodyA, j.bodyB);
     const islandMinSleep = new Map<RigidBody, number>();
     for (const body of this.bodies) {
       if (!body.isDynamic) continue;
@@ -301,6 +388,10 @@ export class World {
       }
     }
   }
+}
+
+function bodyPairKey(a: RigidBody, b: RigidBody): number {
+  return a.id < b.id ? a.id * 1048576 + b.id : b.id * 1048576 + a.id;
 }
 
 /** Anchor of a world point in a body's frame: the inverse rotation of (point − center of mass). */

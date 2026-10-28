@@ -76,3 +76,22 @@ export function integratePosition(body: RigidBody, dt: number): void {
   p.y += body.linearVelocity.y * dt;
   p.z += body.linearVelocity.z * dt;
 }
+
+/**
+ * Rotates a jointed body by its post-solve world angular velocity, q <- exp(w*dt) (x) q. Joints are
+ * evaluated at the pose the position integration starts from, so the orientation must advance
+ * after the constraint solve (standard semi-implicit Euler) rather than before it.
+ */
+export function integrateOrientationPostSolve(body: RigidBody, dt: number): void {
+  if (!body.isSimulated) return;
+  const w = body.angularVelocity;
+  const speed = V.length(w);
+  if (speed > 0) {
+    const half = 0.5 * speed * dt;
+    const s = Math.sin(half) / speed;
+    const dq = new Quat(w.x * s, w.y * s, w.z * s, Math.cos(half));
+    Q.mul(body.orientation, dq, body.orientation);
+    Q.normalize(body.orientation, body.orientation);
+  }
+  body.updateWorldInertia();
+}
