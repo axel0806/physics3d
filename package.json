@@ -1,0 +1,35 @@
+{
+  "name": "physics3d",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "3D rigid-body physics engine in TypeScript with a raw WebGL2 renderer",
+  "scripts": {
+    "dev": "vite demo",
+    "build": "tsc -p tsconfig.json --noEmit && vite build demo",
+    "test": "vitest run",
+    "test:physics": "vitest run tests/physics",
+    "test:coverage": "vitest run --coverage",
+    "bench": "tsx bench/run.ts",
+    "bench:quick": "tsx bench/run.ts --quick",
+    "bench:check": "tsx bench/run.ts --check",
+    "bench:alloc": "node --expose-gc --import tsx bench/alloc.ts",
+    "check": "tsc -p tsconfig.json --noEmit && eslint . && prettier --check .",
+    "format": "prettier --write .",
+    "verify": "pnpm check && pnpm test && pnpm bench:quick"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "@vitest/coverage-v8": "^5.0.5",
+    "eslint": "^10.13.0",
+    "fast-check": "^4.10.2",
+    "playwright": "^1.64.1",
+    "prettier": "^3.9.10",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.1",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  }
+}
