@@ -6,6 +6,10 @@ Phase 2 (shapes + mass properties) — implemented, tests green. Phase reviewer 
 
 ## Done
 
+- **Phase 3**: `src/collision/broadphase` — DynamicTree (AVL-style rotations, SAH-style branch-and-bound insertion, fat AABBs, closest-hit raycast, AABB query, `validate()`), BroadPhase pair manager (deduplicated pairs, incremental re-query of moved proxies, begin/end events emitted only on real transitions).
+  - Fuzz: 5,000 AABBs × 1,000 moves, pair set equal to brute force at every step (incremental reference per move; full O(n²) recheck every 50 steps). Height ≤ 2·log₂ n after randomized insert/remove over 5 seeds. 10,000 random rays and 2,000 random queries match brute force.
+  - Bugs found by tests and fixed: (1) balance skipped nodes using a stale stored height; (2) one rotation could leave a height gap >1 when a new parent sat above a much taller sibling, now rebalanced recursively; (3) event churn from removing and re-adding unchanged pairs.
+
 - **Phase 0**: pnpm project, TypeScript (pinned 5.9 — typescript-eslint requires <6.1), Vite, Vitest, fast-check, ESLint, Prettier, Playwright. `pnpm verify` green.
 - **Phase 1**: `src/math` — Vec3, Quat, Mat3 (incl. Jacobi `symmetricEigen`), Mat4, Transform, AABB, util.
   - 39 tests (property tests at 2000 runs each). 100% line/branch/function coverage on `src/math`.
