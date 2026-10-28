@@ -22,7 +22,7 @@ interface Face {
   readonly d: number;
 }
 
-const MAX_ITER = 128;
+const MAX_ITER = 256;
 
 /**
  * Expanding Polytope Algorithm (van den Bergen). Starts from a tetrahedron enclosing the origin
@@ -38,7 +38,11 @@ export function epa(
 ): EpaResult | null {
   const verts = completeTetrahedron(A, B, simplex);
   if (!verts) return null;
+  // Termination tolerance (on the reach of the nearest face) is loose; visibility must be tight.
+  // A loose visibility test keeps faces that barely see the new point, which folds the polytope
+  // after ~130 splits on rounded shapes and corrupts the normal (measured on a sphere-box case).
   const tol = 1e-6 * Math.max(scale, 1);
+  const visTol = 1e-12 * Math.max(scale, 1);
   let faces: Face[] = [];
   const pts = verts;
   const quads = [
@@ -62,7 +66,7 @@ export function epa(
     const visible: Face[] = [];
     const kept: Face[] = [];
     for (const f of faces) {
-      if (V.dot(f.n, w.w) - f.d > tol) visible.push(f);
+      if (V.dot(f.n, w.w) - f.d > visTol) visible.push(f);
       else kept.push(f);
     }
     const edges = new Map<string, [number, number]>();

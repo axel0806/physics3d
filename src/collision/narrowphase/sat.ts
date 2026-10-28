@@ -39,8 +39,13 @@ export interface SatResult {
   readonly index: number;
 }
 
+/** Plane-clip tolerance (length units); corners within it of a clip plane count as inside. */
+const CLIP_TOLERANCE = 1e-9;
+
 /** Edge axes must beat a face axis by this margin to be chosen (keeps face contacts stable). */
 const EDGE_BIAS = 1e-6;
+/** Overlaps closer than this are ties; the earlier candidate (faces of A, then B, then edges) wins. */
+const TIE_TOLERANCE = 1e-9;
 
 /** Separating-axis test over the 15 candidate axes. For boxes the penetration depth is exact. */
 export function satBoxBox(a: OrientedBox, b: OrientedBox): SatResult {
@@ -54,7 +59,8 @@ export function satBoxBox(a: OrientedBox, b: OrientedBox): SatResult {
     const dn = V.dot(d, n);
     const overlap = projRadius(a, n) + projRadius(b, n) - Math.abs(dn);
     const score = kind === 'edge' ? overlap + EDGE_BIAS : overlap;
-    if (score >= bestScore) return;
+    // Strict improvement by a margin: rounding noise must not flip the reference face between frames.
+    if (score >= bestScore - TIE_TOLERANCE) return;
     bestScore = score;
     const normal = dn >= 0 ? n : V.negate(new Vec3(), n);
     best = { separated: overlap < 0, depth: overlap, normal, kind, index };
@@ -169,7 +175,12 @@ function argmaxAbsDot(axes: readonly [Vec3, Vec3, Vec3], n: Vec3): number {
   return best;
 }
 
-/** Sutherland–Hodgman clip of a convex polygon to the half-space dot(n, p) ≤ d. */
+/**
+ * Sutherland–Hodgman clip of a convex polygon to the half-space dot(n, p) ≤ d. Vertices within
+ * CLIP_TOLERANCE of the plane count as inside and keep their id; only a genuine crossing creates a
+ * new vertex. Without the tolerance, corners lying exactly on a plane (aligned stacks) flip between
+ * inside and outside with rounding, which changes the feature ids and defeats warm starting.
+ */
 function clipPolygon(poly: ClipVertex[], n: Vec3, d: number, idBase: number): ClipVertex[] {
   const out: ClipVertex[] = [];
   for (let i = 0; i < poly.length; i++) {
@@ -177,10 +188,11 @@ function clipPolygon(poly: ClipVertex[], n: Vec3, d: number, idBase: number): Cl
     const nxt = poly[(i + 1) % poly.length] as ClipVertex;
     const dc = V.dot(n, cur.p) - d;
     const dn = V.dot(n, nxt.p) - d;
-    if (dc <= 0) out.push(cur);
-    if ((dc < 0 && dn > 0) || (dc > 0 && dn < 0)) {
-      const t = dc / (dc - dn);
-      out.push({ p: V.lerp(new Vec3(), cur.p, nxt.p, t), id: idBase + i });
+    if (dc <= CLIP_TOLERANCE) out.push(cur);
+    if (dc > CLIP_TOLERANCE && dn < -CLIP_TOLERANCE) {
+      out.push({ p: V.lerp(new Vec3(), cur.p, nxt.p, dc / (dc - dn)), id: idBase + i });
+    } else if (dc < -CLIP_TOLERANCE && dn > CLIP_TOLERANCE) {
+      out.push({ p: V.lerp(new Vec3(), cur.p, nxt.p, dc / (dc - dn)), id: idBase + i });
     }
   }
   return out;
