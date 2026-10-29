@@ -3,3 +3,4 @@ dist
 coverage
 bench/results
 pnpm-lock.yaml
+.claude/worktrees

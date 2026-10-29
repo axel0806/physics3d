@@ -3,3 +3,4 @@ dist
 coverage
 *.tar.gz
 demo/dist
+.claude/worktrees

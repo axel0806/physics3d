@@ -116,6 +116,24 @@ do not go to sleep (limitation 8). Everything else in the plan has an automated 
 - Not verified: the "60 fps in Chrome" criterion (software rendering only; the step time of the large
   scenes is above 16 ms, see Phase 9).
 
+## Phase 9 solve-phase pass (pile-1000-boxes)
+
+- Batched worlds now build the flat arrays straight from the constraints (`ContactBatch.prepare`
+  replaces `prepareContact` + `buildNormalK` + `gather`) and run the contact position passes on the
+  arrays (`solvePositions`, same arithmetic and order). Non-iteration solve overhead for the pile
+  fell from about 13 ms to about 5 ms. Results match the old path (all tests unchanged).
+- The 40 default velocity iterations cost about 1.4 ms each on the pile (2,300 manifolds), so the
+  default solve stays about 60-70 ms. The pile scene therefore sets `velocityIterations: 10` (opt-in
+  per scene; tests keep the 40 default, the 55-box pyramid needs it): solve about 17 ms; 6 iterations
+  about 14 ms.
+- Tried and rejected: precomputed inverse of the 4-point normal matrix (replaces the active-set
+  elimination in the all-active case). The Tikhonov-regularised coplanar matrix is too ill
+  conditioned: the 20-box tower drifted 12 cm. Not merged.
+- Not done: TGS substeps, soft constraints, graph colouring. The max-change convergence test never
+  triggers in a pile (a few constraints keep moving by 0.2 m/s at iteration 40).
+- 8 ms for the whole pile step is not reachable by the solver alone: the solve floor is about
+  14 ms at 6 iterations on this machine.
+
 ## Known limitations (carry-forward)
 
 1. **Near-flat hulls (thickness ratio ≲ 1e-4)**: quickhull can accept a near-duplicate vertex in a

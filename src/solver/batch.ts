@@ -1,5 +1,5 @@
 import type { RigidBody } from '../dynamics/body';
-import type { ContactConstraint } from './contactSolver';
+import type { ContactConstraint, SolverPoint } from './contactSolver';
 
 /**
  * Struct-of-arrays copy of the contact constraints for the velocity iterations. The object
@@ -43,6 +43,9 @@ export class ContactBatch {
   private pMass = new Float64Array(3 * 256); // normal, tangent 1, tangent 2
   private pImpulse = new Float64Array(3 * 256);
   private pTarget = new Float64Array(256);
+  private pSA = new Float64Array(3 * 256); // surface anchor offsets (position solve)
+  private pSB = new Float64Array(3 * 256);
+  private pos = new Float64Array(3 * 64);
 
   /** Largest speed change caused by an impulse update since the last `iterate` began. */
   maxChange = 0;
@@ -52,6 +55,7 @@ export class ContactBatch {
     const cap = Math.max(n, this.invMass.length * 2);
     this.lin = grow(this.lin, 3 * cap);
     this.ang = grow(this.ang, 3 * cap);
+    this.pos = grow(this.pos, 3 * cap);
     this.invMass = grow(this.invMass, cap);
     this.invInertia = grow(this.invInertia, 9 * cap);
   }
@@ -69,7 +73,9 @@ export class ContactBatch {
       this.cPointCount = grow(this.cPointCount, cap);
       this.cKStart = grow(this.cKStart, cap);
     }
-    if (kn > this.K.length) this.K = grow(this.K, Math.max(kn, this.K.length * 2));
+    if (kn > this.K.length) {
+      this.K = grow(this.K, Math.max(kn, this.K.length * 2));
+    }
   }
 
   private growPoints(n: number): void {
@@ -80,6 +86,8 @@ export class ContactBatch {
     this.pMass = grow(this.pMass, 3 * cap);
     this.pImpulse = grow(this.pImpulse, 3 * cap);
     this.pTarget = grow(this.pTarget, cap);
+    this.pSA = grow(this.pSA, 3 * cap);
+    this.pSB = grow(this.pSB, 3 * cap);
   }
 
   private slot(b: RigidBody): number {
@@ -107,8 +115,13 @@ export class ContactBatch {
     return i;
   }
 
-  /** Copies the (already prepared) constraints into the arrays. */
-  gather(contacts: readonly ContactConstraint[]): void {
+  /**
+   * Builds the arrays straight from the constraints and the current poses: offsets from the
+   * centers of mass, effective masses along normal and tangents, the coupled normal matrix and the
+   * restitution target (the arithmetic of `prepareContact` and `buildNormalK`, without the
+   * intermediate objects). Also writes `rA`/`rB` back to the points for debug drawing.
+   */
+  prepare(contacts: readonly ContactConstraint[], threshold: number, dt: number): void {
     this.stamp++;
     this.bodyCount = 1; // slot 0 unused
     this.constraints.length = 0;
@@ -128,34 +141,224 @@ export class ContactBatch {
     let kOff = 0;
     for (const c of contacts) {
       if (!(c.bodyA.isSimulated || c.bodyB.isSimulated)) continue;
+      const bodyA = c.bodyA;
+      const bodyB = c.bodyB;
       this.constraints.push(c);
-      this.cBodyA[k] = this.slot(c.bodyA);
-      this.cBodyB[k] = this.slot(c.bodyB);
-      this.cNormal.set([c.normal.x, c.normal.y, c.normal.z], 3 * k);
-      this.cTan1.set([c.tangent1.x, c.tangent1.y, c.tangent1.z], 3 * k);
-      this.cTan2.set([c.tangent2.x, c.tangent2.y, c.tangent2.z], 3 * k);
+      this.cBodyA[k] = this.slot(bodyA);
+      this.cBodyB[k] = this.slot(bodyB);
+      const nx = c.normal.x;
+      const ny = c.normal.y;
+      const nz = c.normal.z;
+      const t1 = c.tangent1;
+      const t2 = c.tangent2;
+      this.cNormal[3 * k] = nx;
+      this.cNormal[3 * k + 1] = ny;
+      this.cNormal[3 * k + 2] = nz;
+      this.cTan1[3 * k] = t1.x;
+      this.cTan1[3 * k + 1] = t1.y;
+      this.cTan1[3 * k + 2] = t1.z;
+      this.cTan2[3 * k] = t2.x;
+      this.cTan2[3 * k + 1] = t2.y;
+      this.cTan2[3 * k + 2] = t2.z;
       this.cFriction[k] = c.friction;
-      const n = c.points.length;
+      const pts = c.points;
+      const n = pts.length;
       this.cPointStart[k] = q;
       this.cPointCount[k] = n;
       this.cKStart[k] = kOff;
-      if (c.normalK.length === n * n) this.K.set(c.normalK, kOff);
-      kOff += n * n;
-      for (const p of c.points) {
-        this.pRA.set([p.rA.x, p.rA.y, p.rA.z], 3 * q);
-        this.pRB.set([p.rB.x, p.rB.y, p.rB.z], 3 * q);
-        this.pMass[3 * q] = p.normalMass;
-        this.pMass[3 * q + 1] = p.tangentMass1;
-        this.pMass[3 * q + 2] = p.tangentMass2;
-        this.pImpulse[3 * q] = p.impulseN;
-        this.pImpulse[3 * q + 1] = p.impulseT1;
-        this.pImpulse[3 * q + 2] = p.impulseT2;
-        this.pTarget[q] = p.restitutionTarget;
-        q++;
+      const aSim = bodyA.isSimulated;
+      const bSim = bodyB.isSimulated;
+      const ea = bodyA.worldInvInertia.e;
+      const eb = bodyB.worldInvInertia.e;
+      const qa = bodyA.orientation;
+      const qb = bodyB.orientation;
+      const pa = bodyA.position;
+      const pb = bodyB.position;
+      const base = (aSim ? bodyA.invMass : 0) + (bSim ? bodyB.invMass : 0);
+      const sla = bodyA.stepStartLinear;
+      const saa = bodyA.stepStartAngular;
+      const slb = bodyB.stepStartLinear;
+      const sab = bodyB.stepStartAngular;
+      for (let i = 0; i < n; i++) {
+        const p = pts[i] as SolverPoint;
+        // Surface anchors as world offsets (the body-frame anchors rotated by the orientation).
+        rot(qa, p.localA, 0);
+        rot(qb, p.localB, 3);
+        const sax = R[0] as number;
+        const say = R[1] as number;
+        const saz = R[2] as number;
+        const sbx = R[3] as number;
+        const sby = R[4] as number;
+        const sbz = R[5] as number;
+        const o = 3 * (q + i);
+        this.pSA[o] = sax;
+        this.pSA[o + 1] = say;
+        this.pSA[o + 2] = saz;
+        this.pSB[o] = sbx;
+        this.pSB[o + 1] = sby;
+        this.pSB[o + 2] = sbz;
+        // Impulses act at the midpoint of the two surface anchors.
+        const midx = 0.5 * (pa.x + sax + pb.x + sbx);
+        const midy = 0.5 * (pa.y + say + pb.y + sby);
+        const midz = 0.5 * (pa.z + saz + pb.z + sbz);
+        const rax = midx - pa.x;
+        const ray = midy - pa.y;
+        const raz = midz - pa.z;
+        const rbx = midx - pb.x;
+        const rby = midy - pb.y;
+        const rbz = midz - pb.z;
+        this.pRA[o] = rax;
+        this.pRA[o + 1] = ray;
+        this.pRA[o + 2] = raz;
+        this.pRB[o] = rbx;
+        this.pRB[o + 1] = rby;
+        this.pRB[o + 2] = rbz;
+        p.rA.x = rax;
+        p.rA.y = ray;
+        p.rA.z = raz;
+        p.rB.x = rbx;
+        p.rB.y = rby;
+        p.rB.z = rbz;
+        const mN =
+          base +
+          (aSim ? invDot(ea, rax, ray, raz, nx, ny, nz) : 0) +
+          (bSim ? invDot(eb, rbx, rby, rbz, nx, ny, nz) : 0);
+        const m1 =
+          base +
+          (aSim ? invDot(ea, rax, ray, raz, t1.x, t1.y, t1.z) : 0) +
+          (bSim ? invDot(eb, rbx, rby, rbz, t1.x, t1.y, t1.z) : 0);
+        const m2 =
+          base +
+          (aSim ? invDot(ea, rax, ray, raz, t2.x, t2.y, t2.z) : 0) +
+          (bSim ? invDot(eb, rbx, rby, rbz, t2.x, t2.y, t2.z) : 0);
+        this.pMass[o] = mN > 0 ? 1 / mN : 0;
+        this.pMass[o + 1] = m1 > 0 ? 1 / m1 : 0;
+        this.pMass[o + 2] = m2 > 0 ? 1 / m2 : 0;
+        // Restitution from the start-of-step velocities.
+        const vx = slb.x + (sab.y * rbz - sab.z * rby) - sla.x - (saa.y * raz - saa.z * ray);
+        const vy = slb.y + (sab.z * rbx - sab.x * rbz) - sla.y - (saa.z * rax - saa.x * raz);
+        const vz = slb.z + (sab.x * rby - sab.y * rbx) - sla.z - (saa.x * ray - saa.y * rax);
+        const vn0 = vx * nx + vy * ny + vz * nz;
+        let target = vn0 < -threshold ? -c.restitution * vn0 : 0;
+        if (p.gap > 0 && dt > 0) target = -p.gap / dt;
+        this.pTarget[q + i] = target;
+        this.pImpulse[o] = p.impulseN;
+        this.pImpulse[o + 1] = p.impulseT1;
+        this.pImpulse[o + 2] = p.impulseT2;
       }
+      // Coupled normal matrix, with the small diagonal term that keeps coplanar blocks well posed.
+      let maxDiag = 0;
+      for (let i = 0; i < n; i++) {
+        const oi = 3 * (q + i);
+        for (let j = 0; j < n; j++) {
+          const oj = 3 * (q + j);
+          let kk = base;
+          if (aSim)
+            kk += crossDot(
+              ea,
+              this.pRA[oi] as number,
+              this.pRA[oi + 1] as number,
+              this.pRA[oi + 2] as number,
+              this.pRA[oj] as number,
+              this.pRA[oj + 1] as number,
+              this.pRA[oj + 2] as number,
+              nx,
+              ny,
+              nz,
+            );
+          if (bSim)
+            kk += crossDot(
+              eb,
+              this.pRB[oi] as number,
+              this.pRB[oi + 1] as number,
+              this.pRB[oi + 2] as number,
+              this.pRB[oj] as number,
+              this.pRB[oj + 1] as number,
+              this.pRB[oj + 2] as number,
+              nx,
+              ny,
+              nz,
+            );
+          this.K[kOff + i * n + j] = kk;
+          if (i === j && kk > maxDiag) maxDiag = kk;
+        }
+      }
+      const eps = 1e-9 * maxDiag;
+      for (let i = 0; i < n; i++)
+        this.K[kOff + i * n + i] = (this.K[kOff + i * n + i] as number) + eps;
+      kOff += n * n;
+      q += n;
       k++;
     }
     this.constraintCount = k;
+  }
+
+  /**
+   * Nonlinear Gauss-Seidel position correction along the contact normals, linear only (see
+   * `solvePosition` in contactSolver.ts). Reads the bodies' current positions, writes them back.
+   */
+  solvePositions(passes: number, baumgarte: number, slop: number): void {
+    const pos = this.pos;
+    for (let i = 1; i < this.bodyCount; i++) {
+      const b = this.bodies[i] as RigidBody;
+      pos[3 * i] = b.position.x;
+      pos[3 * i + 1] = b.position.y;
+      pos[3 * i + 2] = b.position.z;
+    }
+    for (let pass = 0; pass < passes; pass++) {
+      for (let k = 0; k < this.constraintCount; k++) {
+        const a = this.cBodyA[k] as number;
+        const b = this.cBodyB[k] as number;
+        const imA = this.invMass[a] as number;
+        const imB = this.invMass[b] as number;
+        const kn = imA + imB;
+        if (!(kn > 0)) continue;
+        const nx = this.cNormal[3 * k] as number;
+        const ny = this.cNormal[3 * k + 1] as number;
+        const nz = this.cNormal[3 * k + 2] as number;
+        const start = this.cPointStart[k] as number;
+        const end = start + (this.cPointCount[k] as number);
+        for (let q = start; q < end; q++) {
+          const o = 3 * q;
+          const sep =
+            ((pos[3 * b] as number) +
+              (this.pSB[o] as number) -
+              (pos[3 * a] as number) -
+              (this.pSA[o] as number)) *
+              nx +
+            ((pos[3 * b + 1] as number) +
+              (this.pSB[o + 1] as number) -
+              (pos[3 * a + 1] as number) -
+              (this.pSA[o + 1] as number)) *
+              ny +
+            ((pos[3 * b + 2] as number) +
+              (this.pSB[o + 2] as number) -
+              (pos[3 * a + 2] as number) -
+              (this.pSA[o + 2] as number)) *
+              nz;
+          const error = Math.min(0, sep + slop);
+          if (error === 0) continue;
+          const s = (-baumgarte * error) / kn;
+          if (imA !== 0) {
+            pos[3 * a] = (pos[3 * a] as number) + -nx * s * imA;
+            pos[3 * a + 1] = (pos[3 * a + 1] as number) + -ny * s * imA;
+            pos[3 * a + 2] = (pos[3 * a + 2] as number) + -nz * s * imA;
+          }
+          if (imB !== 0) {
+            pos[3 * b] = (pos[3 * b] as number) + nx * s * imB;
+            pos[3 * b + 1] = (pos[3 * b + 1] as number) + ny * s * imB;
+            pos[3 * b + 2] = (pos[3 * b + 2] as number) + nz * s * imB;
+          }
+        }
+      }
+    }
+    for (let i = 1; i < this.bodyCount; i++) {
+      const b = this.bodies[i] as RigidBody;
+      if (!b.isSimulated) continue;
+      b.position.x = pos[3 * i] as number;
+      b.position.y = pos[3 * i + 1] as number;
+      b.position.z = pos[3 * i + 2] as number;
+    }
   }
 
   /** Re-applies the accumulated impulses from the previous step. */
@@ -488,6 +691,60 @@ export class ContactBatch {
       }
     }
   }
+}
+
+const R = new Float64Array(6);
+
+/** Rotates v by q into R[off..off+2]. */
+function rot(
+  q: { x: number; y: number; z: number; w: number },
+  v: { x: number; y: number; z: number },
+  off: number,
+): void {
+  const tx = 2 * (q.y * v.z - q.z * v.y);
+  const ty = 2 * (q.z * v.x - q.x * v.z);
+  const tz = 2 * (q.x * v.y - q.y * v.x);
+  R[off] = v.x + q.w * tx + (q.y * tz - q.z * ty);
+  R[off + 1] = v.y + q.w * ty + (q.z * tx - q.x * tz);
+  R[off + 2] = v.z + q.w * tz + (q.x * ty - q.y * tx);
+}
+
+/** (r × d) · I (r × d) for a 3x3 row-major I. */
+function invDot(
+  e: ArrayLike<number>,
+  rx: number,
+  ry: number,
+  rz: number,
+  dx: number,
+  dy: number,
+  dz: number,
+): number {
+  return crossDot(e, rx, ry, rz, rx, ry, rz, dx, dy, dz);
+}
+
+/** (r1 × n) · I (r2 × n) for a 3x3 row-major I. */
+function crossDot(
+  e: ArrayLike<number>,
+  r1x: number,
+  r1y: number,
+  r1z: number,
+  r2x: number,
+  r2y: number,
+  r2z: number,
+  nx: number,
+  ny: number,
+  nz: number,
+): number {
+  const ax = r1y * nz - r1z * ny;
+  const ay = r1z * nx - r1x * nz;
+  const az = r1x * ny - r1y * nx;
+  const bx = r2y * nz - r2z * ny;
+  const by = r2z * nx - r2x * nz;
+  const bz = r2x * ny - r2y * nx;
+  const ix = (e[0] as number) * bx + (e[1] as number) * by + (e[2] as number) * bz;
+  const iy = (e[3] as number) * bx + (e[4] as number) * by + (e[5] as number) * bz;
+  const iz = (e[6] as number) * bx + (e[7] as number) * by + (e[8] as number) * bz;
+  return ax * ix + ay * iy + az * iz;
 }
 
 const BLOCK_MAX = 4;

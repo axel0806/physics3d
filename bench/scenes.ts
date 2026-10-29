@@ -37,7 +37,7 @@ export const scenes: BenchScene[] = [
     name: 'pile-1000-boxes',
     description: '1,000 boxes (0.5 m) dropped in ten layers of 100 into a walled arena',
     build() {
-      const w = new World();
+      const w = new World({ velocityIterations: 10 });
       arena(w, 4);
       const r = rng(1);
       for (let layer = 0; layer < 10; layer++) {
