@@ -14,7 +14,7 @@ const camera = new Camera();
 const debug: DebugFlags = defaultDebug();
 
 let spec: SceneSpec = scenes.find((s) => s.id === params.get('scene')) ?? (scenes[0] as SceneSpec);
-let inst: SceneInstance;
+let inst: SceneInstance = spec.build();
 let playing = true;
 let stepOnce = false;
 let simTime = 0;
