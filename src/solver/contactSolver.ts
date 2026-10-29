@@ -440,7 +440,12 @@ export function normalSpeedAt(c: ContactConstraint, p: SolverPoint): number {
  * separation reaches −slop, using the current poses and leaving velocities unchanged.
  * Returns the most negative remaining position error.
  */
-export function solvePosition(c: ContactConstraint, baumgarte: number, slop: number): number {
+export function solvePosition(
+  c: ContactConstraint,
+  baumgarte: number,
+  slop: number,
+  maxStep = Infinity,
+): number {
   let worst = 0;
   const a = c.bodyA;
   const b = c.bodyB;
@@ -452,11 +457,13 @@ export function solvePosition(c: ContactConstraint, baumgarte: number, slop: num
       (b.position.x + rb.x - a.position.x - ra.x) * n.x +
       (b.position.y + rb.y - a.position.y - ra.y) * n.y +
       (b.position.z + rb.z - a.position.z - ra.z) * n.z;
-    const error = Math.min(0, sep + slop);
+    const error = Math.max(-maxStep / baumgarte, Math.min(0, sep + slop));
     worst = Math.min(worst, error);
     if (error === 0) continue;
     // Linear-only correction, so the effective mass is the translational one.
-    const kn = (a.isSimulated ? a.invMass : 0) + (b.isSimulated ? b.invMass : 0);
+    const ima = a.isSimulated ? a.invMass : 0;
+    const imb = b.isSimulated ? b.invMass : 0;
+    const kn = ima + imb;
     if (!(kn > 0)) continue;
     const s = (-baumgarte * error) / kn;
     applyPositionImpulse(a, -n.x * s, -n.y * s, -n.z * s);

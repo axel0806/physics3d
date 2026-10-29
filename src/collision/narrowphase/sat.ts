@@ -109,11 +109,11 @@ interface ClipVertex {
  * the reference face's side planes and keep the points that penetrate it. Edge contacts yield one
  * closest-point contact. Feature ids depend only on the geometry, so they persist across frames.
  */
-export function boxBoxManifold(a: OrientedBox, b: OrientedBox): ContactManifold | null {
+export function boxBoxManifold(a: OrientedBox, b: OrientedBox, margin = 0): ContactManifold | null {
   const sat = satBoxBox(a, b);
-  if (sat.separated) return null;
+  if (sat.depth < -margin) return null;
   const N = sat.normal;
-  if (sat.kind === 'edge') return edgeContact(a, b, N, sat.depth);
+  if (sat.kind === 'edge') return edgeContact(a, b, N, sat.depth, margin > 0);
 
   const refIsA = sat.kind === 'faceA';
   const ref = refIsA ? a : b;
@@ -151,14 +151,15 @@ export function boxBoxManifold(a: OrientedBox, b: OrientedBox): ContactManifold 
   const points: ContactPoint[] = [];
   for (const v of poly) {
     const depth = planeOffset - V.dot(n, v.p);
-    if (depth < -1e-9) continue;
-    const dd = Math.max(0, depth);
+    if (depth < -Math.max(1e-9, margin)) continue;
+    // Within the margin the depth stays negative: a speculative point that is still apart.
+    const dd = margin > 0 ? depth : Math.max(0, depth);
     const q = V.addScaled(new Vec3(), v.p, n, dd);
     const pointA = refIsA ? q : v.p;
     const pointB = refIsA ? v.p : q;
     points.push(makeContactPoint(pointA, pointB, dd, v.id));
   }
-  if (points.length === 0) return edgeContact(a, b, N, sat.depth);
+  if (points.length === 0) return edgeContact(a, b, N, sat.depth, margin > 0);
   return { normal: V.copy(new Vec3(), N), points: reduceToFour(points) };
 }
 
@@ -199,11 +200,17 @@ function clipPolygon(poly: ClipVertex[], n: Vec3, d: number, idBase: number): Cl
 }
 
 /** Single contact at the closest points of the two support edges along the SAT edge axis. */
-function edgeContact(a: OrientedBox, b: OrientedBox, N: Vec3, depth: number): ContactManifold {
+function edgeContact(
+  a: OrientedBox,
+  b: OrientedBox,
+  N: Vec3,
+  depth: number,
+  signed = false,
+): ContactManifold {
   const ea = supportEdge(a, N);
   const eb = supportEdge(b, V.negate(new Vec3(), N));
   const [s] = closestSegmentParams(ea[0], ea[1], eb[0], eb[1]);
-  const dd = Math.max(0, depth);
+  const dd = signed ? depth : Math.max(0, depth);
   // A's surface point is the closest point on its edge; B's is pushed back by −N·depth.
   const pointA = V.lerp(new Vec3(), ea[0], ea[1], s);
   const pointB = V.addScaled(new Vec3(), pointA, N, -dd);

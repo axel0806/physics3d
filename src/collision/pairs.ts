@@ -37,7 +37,7 @@ export function swapManifold(m: ContactManifold): ContactManifold {
  * Contact manifold between two world-placed convex shapes, normal from A to B. Analytic paths are
  * used for sphere, box, and capsule pairs; anything else goes through GJK/EPA with one point.
  */
-export function manifoldOf(A: WorldShape, B: WorldShape): ContactManifold | null {
+export function manifoldOf(A: WorldShape, B: WorldShape, margin = 0): ContactManifold | null {
   const a = A.shape;
   const b = B.shape;
   if (a instanceof Sphere && b instanceof Sphere) {
@@ -52,7 +52,7 @@ export function manifoldOf(A: WorldShape, B: WorldShape): ContactManifold | null
     return m ? swapManifold(m) : null;
   }
   if (a instanceof Box && b instanceof Box) {
-    return boxBoxManifold(orientedBox(a, A.transform), orientedBox(b, B.transform));
+    return boxBoxManifold(orientedBox(a, A.transform), orientedBox(b, B.transform), margin);
   }
   if (a instanceof Capsule && b instanceof Capsule) {
     const [pa, qa] = segment(a, A.transform);

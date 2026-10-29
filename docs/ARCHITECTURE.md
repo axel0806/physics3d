@@ -16,7 +16,7 @@ snapshot velocities (restitution uses start-of-step speeds)
   ├─ contact solve: warm start → velocity iterations (block normal LCP, then friction)
   ├─ integrate position: translate by the post-solve velocity
   ├─ position correction: NGS, linear only, slop 0.2 mm
-  └─ islands (union-find over contacts) → sleep when all bodies are slow for 0.5 s
+  └─ islands (union-find over contacts) → sleep when a body and its neighbours are slow for 0.5 s
 ```
 
 Modules: `src/math` (vectors, quaternions, matrices, transforms, AABB), `src/shapes`
@@ -53,7 +53,7 @@ contacts exist only for shapes that really overlap, and those are a function of 
 ## Design decisions and tradeoffs
 
 **Continuous collision detection.** Bodies with `ccd: true` use one of two modes (`World.ccdMode`).
-*Sweep* (default, `src/collision/toi.ts`): conservative advancement on GJK distance finds the first
+_Sweep_ (default, `src/collision/toi.ts`): conservative advancement on GJK distance finds the first
 time of impact of the body's translation against each collider in the swept bounds. Because the
 separation of two translating convex shapes is convex in time, stepping by (gap / closing speed)
 never overshoots. At the impact the body is placed at the target separation (`linearSlop`), an
@@ -61,7 +61,7 @@ impulse removes the approach speed (with restitution above the threshold), and t
 continues with the new velocity, up to four events. Bodies only sweep when they travel more than a
 quarter of their thinnest collider extent per step, so slow bodies take the ordinary path
 unchanged. Limits: other bodies count as stationary during the sweep, rotation is not swept, no
-friction impulse at the impact. *Speculative*: while shapes are still apart but the closing speed
+friction impulse at the impact. _Speculative_: while shapes are still apart but the closing speed
 would cover the gap this step, a one-point contact with a negative depth lets the solver cancel the
 approach beyond the gap. It needs no time-of-impact search and works with the whole solver
 (friction, stacking), but it builds the contact from the closest feature at the start of the step.
@@ -139,8 +139,19 @@ the discrete penetration at impact is up to v·dt. Energy error for a bouncing b
 in dt: 4.9e-3 at 240 Hz, 6.1e-4 at 1920 Hz (measured). Speculative contacts would remove the error;
 they are a candidate for the CCD work in Phase 7.
 
-**Sleeping.** Islands come from union-find over contacts. A body sleeps once its island has stayed
-below 1e-2 m/s and 1e-2 rad/s for 0.5 s. A new contact wakes its bodies; a persisting one does not
-(waking on every step kept resting stacks awake).
+**Sleeping.** A body sleeps once it and every dynamic body it touches have stayed below
+`sleepLinearSpeed` (0.04 m/s) and `sleepAngularSpeed` (0.15 rad/s) for 0.5 s; bodies joined by
+joints sleep as a group (union-find over joints only). Neighbour-local sleep, rather than one island
+per connected heap, matters in dense piles: one restless body only delays its own neighbours. A
+sleeper wakes when a body moving faster than `wakeSpeedFactor` times the sleep speeds touches it, or
+when a new contact with a moving or kinematic body appears. Plain new contacts between settling
+bodies do not wake anything: with the contact margin they flicker in and out and used to wake the
+whole heap every second. Two contact settings make heaps able to settle. `contactMargin` (2 mm)
+keeps box-box points that are still apart as speculative points, so a resting box keeps all its
+corners instead of rocking between one and two. `contactSlop` (5 mm) is the penetration that
+position correction leaves alone; a loaded heap carries millimetres of residual compression, and
+correcting below that pushed bodies up every step so gravity dropped them again (energy fed back
+through the position change). Measured on 400 random boxes: 0 of 400 asleep after 20 s before,
+all asleep at 11.7 s after. Limit: not every pile reaches full sleep (see PROGRESS.md, limitation 8).
 
 **Friction and CCD.** No continuous collision yet; fast bodies can tunnel. That is Phase 7.

@@ -151,7 +151,22 @@ export class World {
   restitutionThreshold: number;
   baumgarte: number;
   linearSlop: number;
+  /**
+   * Penetration that contact position correction leaves alone (m). Below the residual of a
+   * loaded heap, correcting makes bodies trade tiny hops with their neighbours forever; see
+   * docs/ARCHITECTURE.md (Sleeping).
+   */
+  contactSlop = 0.005;
+  /** Largest push-out (m) one contact point applies per position iteration. */
+  maxContactCorrection = Infinity;
+  /** Box-box contacts are kept this far before touching, so a resting box keeps all its corners. */
+  contactMargin = 0.002;
   sleepTimeLimit: number;
+  /** A body counts as at rest below these speeds (m/s, rad/s). */
+  /** A sleeper wakes when a neighbour moves faster than this multiple of the sleep speeds. */
+  wakeSpeedFactor = 3;
+  sleepLinearSpeed = 0.04;
+  sleepAngularSpeed = 0.15;
   ccdMode: 'sweep' | 'speculative';
   /** Largest velocity (m/s or rad/s) that one joint position correction may feed back. */
   maxCorrectionSpeed = 1;
@@ -652,7 +667,8 @@ export class World {
     for (let it = 0; it < this.positionIterations; it++) {
       if (it < this.contactPositionIterations) {
         for (const c of ordered) {
-          if (this.constraintActive(c)) solvePosition(c, this.baumgarte, this.linearSlop);
+          if (this.constraintActive(c))
+            solvePosition(c, this.baumgarte, this.contactSlop, this.maxContactCorrection);
         }
       }
       for (const j of this.joints) if (j.active) j.solveLimits();
@@ -934,10 +950,7 @@ export class World {
       const old = subs?.get(tri + 1);
       const c = this.makeConstraint(ca, cb, m, old, tri + 1);
       next.set(tri + 1, c);
-      if (!old && (ca.body.awake || cb.body.awake)) {
-        ca.body.wake();
-        cb.body.wake();
-      }
+      if (!old) this.wakeOnNewContact(ca.body, cb.body);
     }
     const had = subs !== undefined && subs.size > 0;
     if (next.size > 0) this.meshContacts.set(key, next);
@@ -956,7 +969,7 @@ export class World {
     const placedA = { shape: ca.shape, transform: ta };
     const placedB = { shape: cb.shape, transform: tb };
     const m =
-      manifoldOf(placedA, placedB) ??
+      manifoldOf(placedA, placedB, this.contactMargin) ??
       (this.ccdMode === 'speculative' ? this.speculative(ca, cb, placedA, placedB, dt) : null);
     const old = this.contacts.get(key);
     if (!m) {
@@ -972,10 +985,7 @@ export class World {
     this.contacts.set(key, c);
     // A new contact wakes an island that touches an awake body. Persisting contacts do not wake
     // anything, so resting stacks can accumulate sleep time.
-    if (!old && (ca.body.awake || cb.body.awake)) {
-      ca.body.wake();
-      cb.body.wake();
-    }
+    if (!old) this.wakeOnNewContact(ca.body, cb.body);
   }
 
   /** Builds a solver constraint from a manifold, carrying impulses over from `old` by feature id. */
@@ -1058,7 +1068,34 @@ export class World {
     for (const l of this.listeners) l(e);
   }
 
-  /** Puts islands of slow bodies to sleep, using union-find over active contacts. */
+  /** True when the body moves clearly faster than the sleep speeds (not just settling). */
+  private isMoving(b: RigidBody): boolean {
+    return (
+      V.lengthSq(b.linearVelocity) > (this.wakeSpeedFactor * this.sleepLinearSpeed) ** 2 ||
+      V.lengthSq(b.angularVelocity) > (this.wakeSpeedFactor * this.sleepAngularSpeed) ** 2
+    );
+  }
+
+  /**
+   * A new contact wakes a sleeper only when the awake body is a kinematic or moving one. Contacts
+   * on a settling heap appear and vanish at the contact margin; waking on each of those kept the
+   * whole heap cycling between sleep and wake. Persisting contacts never wake anything.
+   */
+  private wakeOnNewContact(a: RigidBody, b: RigidBody): void {
+    if (a.awake === b.awake) return;
+    const sleeper = a.awake ? b : a;
+    const other = a.awake ? a : b;
+    if (!sleeper.isDynamic) return;
+    if (!other.isDynamic || this.isMoving(other)) sleeper.wake();
+  }
+
+  /**
+   * Puts resting bodies to sleep. Jointed bodies sleep together (union-find over joints). A body
+   * sleeps once it and every body it touches have been slow for `sleepTimeLimit`, so one restless
+   * body only delays its own neighbours instead of a whole connected heap. A moving body that
+   * touches a sleeping one wakes it, which keeps sleepers from hanging in the air when their
+   * support moves.
+   */
   private updateSleep(dt: number): void {
     // Union-find over the bodies, with the parent links stored on the bodies themselves.
     const find = (b: RigidBody): RigidBody => {
@@ -1072,28 +1109,60 @@ export class World {
     for (const body of this.bodies) {
       body.islandParent = body;
       body.islandMin = Infinity;
+      if (!body.isDynamic) continue;
+      const slow =
+        V.lengthSq(body.linearVelocity) < this.sleepLinearSpeed ** 2 &&
+        V.lengthSq(body.angularVelocity) < this.sleepAngularSpeed ** 2;
+      body.sleepTime = slow ? body.sleepTime + dt : 0;
+      body.islandMin = body.sleepTime;
     }
-    // Islands connect through dynamic bodies only: a shared static floor or anchor must not merge
-    // unrelated groups.
-    const link = (a: RigidBody, b: RigidBody): void => {
+    // A shared static floor or anchor never couples bodies.
+    this.forEachContact((c) => {
+      const a = c.bodyA;
+      const b = c.bodyB;
       if (!a.isDynamic || !b.isDynamic) return;
+      // islandMin starts as the body's own sleepTime; neighbours only ever lower it.
+      if (b.sleepTime < a.islandMin) a.islandMin = b.sleepTime;
+      if (a.sleepTime < b.islandMin) b.islandMin = a.sleepTime;
+    });
+    // Waking is deferred (islandMin = -1 marks the sleeper) so a body woken in this pass does not
+    // itself count as a mover.
+    let anyWake = false;
+    this.forEachContact((c) => {
+      const a = c.bodyA;
+      const b = c.bodyB;
+      if (!a.isDynamic || !b.isDynamic || a.awake === b.awake) return;
+      const sleeper = a.awake ? b : a;
+      const mover = a.awake ? a : b;
+      // Only a clearly moving body wakes a sleeper; the faint twitching of a settling heap must not.
+      if (mover.sleepTime === 0 && this.isMoving(mover)) {
+        sleeper.islandMin = -1;
+        anyWake = true;
+      }
+    });
+    if (anyWake) {
+      for (const body of this.bodies) {
+        if (body.isDynamic && !body.awake && body.islandMin === -1) body.wake();
+      }
+    }
+    for (const j of this.joints) {
+      const a = j.bodyA;
+      const b = j.bodyB;
+      if (!a.isDynamic || !b.isDynamic) continue;
       const ra = find(a);
       const rb = find(b);
       if (ra !== rb) ra.islandParent = rb;
-    };
-    this.forEachContact((c) => link(c.bodyA, c.bodyB));
-    for (const j of this.joints) link(j.bodyA, j.bodyB);
+    }
+    // Joint groups take the minimum over their members; a woken member keeps the group awake.
     for (const body of this.bodies) {
       if (!body.isDynamic) continue;
-      const slow =
-        V.lengthSq(body.linearVelocity) < 1e-4 && V.lengthSq(body.angularVelocity) < 1e-4;
-      body.sleepTime = slow ? body.sleepTime + dt : 0;
       const root = find(body);
-      root.islandMin = Math.min(root.islandMin, body.sleepTime);
+      if (root !== body) root.islandMin = Math.min(root.islandMin, body.islandMin);
     }
     for (const body of this.bodies) {
       if (!body.isDynamic || !body.awake) continue;
-      const ready = find(body).islandMin >= this.sleepTimeLimit;
+      const ready =
+        (body.jointCount > 0 ? find(body).islandMin : body.islandMin) >= this.sleepTimeLimit;
       if (ready) {
         body.awake = false;
         body.linearVelocity.x = body.linearVelocity.y = body.linearVelocity.z = 0;
