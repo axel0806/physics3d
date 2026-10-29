@@ -1,6 +1,7 @@
 import { AABB, Vec3 } from '../math';
 import * as V from '../math/vec3';
 import * as BB from '../math/aabb';
+import { MeshBvh } from './meshBvh';
 
 /** Static, non-convex triangle mesh. Has no mass; use with static bodies only. */
 export class TriangleMesh {
@@ -8,6 +9,7 @@ export class TriangleMesh {
   readonly vertices: readonly Vec3[];
   readonly indices: Uint32Array;
   readonly bounds: AABB;
+  private bvhCache: MeshBvh | null = null;
 
   constructor(vertices: readonly Vec3[], indices: ArrayLike<number>) {
     if (indices.length % 3 !== 0) throw new RangeError('mesh index count must be a multiple of 3');
@@ -19,6 +21,17 @@ export class TriangleMesh {
     this.indices = Uint32Array.from(indices);
     this.bounds = BB.empty(new AABB());
     for (const v of this.vertices) BB.expandPoint(this.bounds, v);
+  }
+
+  /** Bounding-volume hierarchy over the triangles, built on first use. */
+  get bvh(): MeshBvh {
+    this.bvhCache ??= new MeshBvh(this.vertices, this.indices);
+    return this.bvhCache;
+  }
+
+  /** Writes the local-frame bounding box into `out`. */
+  localBounds(out: AABB): AABB {
+    return BB.copy(out, this.bounds);
   }
 
   get triangleCount(): number {

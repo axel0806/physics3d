@@ -3,7 +3,7 @@ import * as V from '../math/vec3';
 import * as BB from '../math/aabb';
 import * as T from '../math/transform';
 import * as Q from '../math/quat';
-import { RigidBody, type BodyOptions, type Collider } from '../dynamics/body';
+import { RigidBody, type BodyOptions, type Collider, type ColliderShape } from '../dynamics/body';
 import {
   integratePosition,
   integrateOrientation,
@@ -11,7 +11,8 @@ import {
   integrateVelocities,
 } from '../dynamics/integrate';
 import type { ConvexShape } from '../shapes/shape';
-import { Sphere } from '../shapes';
+import { Sphere, Triangle, TriangleMesh } from '../shapes';
+import type { Placed } from '../collision/narrowphase';
 import { BroadPhase, pairKey } from '../collision/broadphase';
 import { Joint } from '../constraints/joint';
 import { manifoldOf } from '../collision/pairs';
@@ -87,6 +88,7 @@ export interface WorldSnapshot {
   readonly bodies: Float64Array;
   readonly contacts: readonly {
     readonly pair: [number, number];
+    readonly sub: number;
     readonly points: readonly { id: number; n: number; t1: number; t2: number }[];
   }[];
   readonly joints: readonly (readonly number[])[];
@@ -149,6 +151,8 @@ export class World {
   /** Frames stepped so far. */
   frame = 0;
   private readonly contacts = new Map<number, ContactConstraint>();
+  /** Contacts with mesh triangles: pair key, then triangle index. */
+  private readonly meshContacts = new Map<number, Map<number, ContactConstraint>>();
   private readonly colliderProxy = new Map<Collider, number>();
   private readonly proxyCollider = new Map<number, Collider>();
   private readonly jointedPairs = new Set<number>();
@@ -177,7 +181,10 @@ export class World {
   }
 
   /** Attaches a convex shape to a body. Call refreshMass after adding colliders. */
-  createCollider(body: RigidBody, shape: ConvexShape, options: ColliderOptions = {}): Collider {
+  createCollider(body: RigidBody, shape: ColliderShape, options: ColliderOptions = {}): Collider {
+    if (shape instanceof TriangleMesh && body.type !== 'static') {
+      throw new RangeError('a triangle mesh collider needs a static body');
+    }
     const c: Collider = {
       body,
       shape,
@@ -226,23 +233,44 @@ export class World {
    * order in which contacts were created. Snapshot/restore and replays then match bit for bit.
    */
   private orderedContacts(): ContactConstraint[] {
-    return [...this.contacts.entries()].sort((x, y) => x[0] - y[0]).map(([, c]) => c);
+    const all: { key: number; c: ContactConstraint }[] = [];
+    for (const [key, c] of this.contacts) all.push({ key, c });
+    for (const [key, subs] of this.meshContacts)
+      for (const c of subs.values()) all.push({ key, c });
+    return all.sort((x, y) => x.key - y.key || x.c.sub - y.c.sub).map((e) => e.c);
+  }
+
+  private forEachContact(fn: (c: ContactConstraint) => void): void {
+    for (const c of this.contacts.values()) fn(c);
+    for (const subs of this.meshContacts.values()) for (const c of subs.values()) fn(c);
   }
 
   /** Current contact constraints (for inspection and tests). */
   activeContacts(): ContactConstraint[] {
-    return [...this.contacts.values()];
+    return this.orderedContacts();
   }
 
   /** Removes a collider: its broadphase proxy and every contact it was part of (with end events). */
   destroyCollider(c: Collider): void {
     const proxy = this.colliderProxy.get(c);
     if (proxy === undefined) return;
+    const ended = new Set<number>();
     for (const [key, k] of [...this.contacts.entries()]) {
       if (k.pair[0] !== proxy && k.pair[1] !== proxy) continue;
       this.contacts.delete(key);
-      const first = k.pair[0] === proxy;
-      const other = this.proxyCollider.get(first ? k.pair[1] : k.pair[0]);
+      ended.add(key);
+    }
+    for (const [key, subs] of [...this.meshContacts.entries()]) {
+      const any = subs.values().next().value as ContactConstraint | undefined;
+      if (!any || (any.pair[0] !== proxy && any.pair[1] !== proxy)) continue;
+      this.meshContacts.delete(key);
+      ended.add(key);
+    }
+    for (const key of [...ended].sort((x, y) => x - y)) {
+      const lo = Math.floor(key / 0x4000000);
+      const hi = key - lo * 0x4000000;
+      const first = lo === proxy;
+      const other = this.proxyCollider.get(first ? hi : lo);
       if (other) {
         other.body.wake();
         this.emit({ kind: 'end', a: first ? c : other, b: first ? other : c });
@@ -347,15 +375,15 @@ export class World {
     const box = BB.union(new AABB(), start, end);
     let best: ShapeCastHit | null = null;
     for (const c of this.candidates(box, filter)) {
-      const toi = timeOfImpact(
-        { shape, transform },
-        { shape: c.shape, transform: c.body.colliderTransform(c, new Transform()) },
-        translation,
-        new Vec3(),
-        { target: CAST_SKIN, tolerance: 0.1 * CAST_SKIN, maxIterations: 200 },
-      );
-      if (toi && (!best || toi.t < best.fraction)) {
-        best = { collider: c, fraction: toi.t, point: toi.pointB, normal: toi.normal };
+      for (const part of this.convexParts(c, box)) {
+        const toi = timeOfImpact({ shape, transform }, part, translation, new Vec3(), {
+          target: CAST_SKIN,
+          tolerance: 0.1 * CAST_SKIN,
+          maxIterations: 200,
+        });
+        if (toi && (!best || toi.t < best.fraction)) {
+          best = { collider: c, fraction: toi.t, point: toi.pointB, normal: toi.normal };
+        }
       }
     }
     return best;
@@ -365,13 +393,30 @@ export class World {
   overlap(shape: ConvexShape, transform: Transform, filter: QueryFilter = {}): Collider[] {
     const out: Collider[] = [];
     for (const c of this.candidates(placedBounds(shape, transform), filter)) {
-      const hit = gjk(
-        { shape, transform },
-        { shape: c.shape, transform: c.body.colliderTransform(c, new Transform()) },
-      );
-      if (hit.overlap) out.push(c);
+      const box = placedBounds(shape, transform);
+      if (this.convexParts(c, box).some((part) => gjk({ shape, transform }, part).overlap)) {
+        out.push(c);
+      }
     }
     return out;
+  }
+
+  /**
+   * The convex pieces of a collider near a world-space box: the collider's own shape, or for a
+   * mesh the triangles whose bounds overlap the box (as thin convex shapes).
+   */
+  private convexParts(c: Collider, box: AABB): Placed[] {
+    const t = c.body.colliderTransform(c, new Transform());
+    const shape = c.shape;
+    if (!(shape instanceof TriangleMesh)) return [{ shape, transform: t }];
+    const tris: number[] = [];
+    shape.bvh.query(toLocalBox(box, t), tris);
+    tris.sort((x, y) => x - y);
+    const pts: [Vec3, Vec3, Vec3] = [new Vec3(), new Vec3(), new Vec3()];
+    return tris.map((i) => {
+      shape.triangle(i, pts);
+      return { shape: new Triangle(pts[0], pts[1], pts[2]), transform: t };
+    });
   }
 
   private candidates(box: AABB, filter: QueryFilter): Collider[] {
@@ -409,6 +454,7 @@ export class World {
       bodies,
       contacts: this.orderedContacts().map((c) => ({
         pair: [c.pair[0], c.pair[1]] as [number, number],
+        sub: c.sub,
         points: c.points.map((p) => ({
           id: p.id,
           n: p.impulseN,
@@ -449,12 +495,22 @@ export class World {
     }
     this.broadphase.updatePairs();
     this.contacts.clear();
+    this.meshContacts.clear();
     for (const sc of snap.contacts) {
       const ca = this.proxyCollider.get(sc.pair[0]);
       const cb = this.proxyCollider.get(sc.pair[1]);
       if (!ca || !cb) continue;
       const zero = () => new Vec3();
-      this.contacts.set(pairKey(sc.pair[0], sc.pair[1]), {
+      const pk = pairKey(sc.pair[0], sc.pair[1]);
+      const put = (c: ContactConstraint): void => {
+        if (sc.sub === 0) this.contacts.set(pk, c);
+        else {
+          let subs = this.meshContacts.get(pk);
+          if (!subs) this.meshContacts.set(pk, (subs = new Map()));
+          subs.set(sc.sub, c);
+        }
+      };
+      put({
         bodyA: ca.body,
         bodyB: cb.body,
         normal: zero(),
@@ -463,7 +519,8 @@ export class World {
         friction: 0,
         restitution: 0,
         pair: sc.pair,
-        normalK: [],
+        sub: sc.sub,
+        normalK: new Float64Array(0),
         points: sc.points.map((p) => ({
           id: p.id,
           localA: zero(),
@@ -489,16 +546,37 @@ export class World {
     const words: number[] = [snap.frame];
     for (const v of snap.bodies) words.push(v);
     for (const c of snap.contacts) {
-      words.push(c.pair[0], c.pair[1]);
+      words.push(c.pair[0], c.pair[1], c.sub);
       for (const p of c.points) words.push(p.id, p.n, p.t1, p.t2);
     }
     for (const j of snap.joints) for (const v of j) words.push(v);
     return hashDoubles(words);
   }
 
+  /**
+   * Time source for profiling, in milliseconds (the engine never reads a clock itself, which keeps
+   * it deterministic; benchmarks inject `performance.now`). When set, `timings` holds the last
+   * step's time per phase.
+   */
+  clock: (() => number) | null = null;
+  readonly timings = { broadphase: 0, narrowphase: 0, solve: 0, integrate: 0 };
+  private lapTime = 0;
+
+  private lap(phase: keyof World['timings']): void {
+    if (!this.clock) return;
+    const now = this.clock();
+    this.timings[phase] += now - this.lapTime;
+    this.lapTime = now;
+  }
+
   /** Advances the simulation by dt seconds. */
   step(dt: number): void {
     if (!(dt > 0)) throw new RangeError('dt must be positive');
+    if (this.clock) {
+      const t = this.timings;
+      t.broadphase = t.narrowphase = t.solve = t.integrate = 0;
+      this.lapTime = this.clock();
+    }
     for (const body of this.bodies) {
       body.snapshotPose();
       body.snapshotVelocities();
@@ -516,6 +594,7 @@ export class World {
       integrateVelocities(body, this.gravity, dt);
       if (body.jointCount === 0) integrateOrientation(body, dt);
     }
+    this.lap('integrate');
     for (const j of this.joints) {
       if (!j.active) continue;
       j.prepare(dt);
@@ -532,6 +611,7 @@ export class World {
       for (const j of this.joints) if (j.active) j.solveVelocity(dt);
       for (const c of ordered) if (this.constraintActive(c)) solveVelocity(c);
     }
+    this.lap('solve');
     // Jointed bodies rotate after the solve, from the same pose the joints were evaluated at;
     // free bodies were rotated before it (see integrateOrientation).
     for (const body of this.bodies)
@@ -543,6 +623,7 @@ export class World {
       if (this.ccdMode === 'sweep' && this.needsSweep(body, dt)) this.sweepBody(body, dt);
       else integratePosition(body, dt);
     }
+    this.lap('integrate');
     const feedback = new Map<RigidBody, [Vec3, Vec3]>();
     for (let it = 0; it < this.positionIterations; it++) {
       for (const c of ordered) {
@@ -552,8 +633,10 @@ export class World {
       for (const j of this.joints) if (j.active) this.correctJoint(j, feedback);
     }
     this.applyFeedback(feedback, dt);
+    this.lap('solve');
     for (const body of this.bodies) body.updateWorldInertia();
     this.updateSleep(dt);
+    this.lap('integrate');
     this.frame++;
   }
 
@@ -600,15 +683,16 @@ export class World {
         for (const proxy of this.broadphase.query(swept)) {
           const cb = this.proxyCollider.get(proxy);
           if (!cb || !this.shouldCollide(ca, cb)) continue;
-          const tb = cb.body.colliderTransform(cb, new Transform());
-          const toi = timeOfImpact(
-            { shape: ca.shape, transform: ta },
-            { shape: cb.shape, transform: tb },
-            d,
-            new Vec3(),
-            { target: this.linearSlop, tolerance: 0.25 * this.linearSlop },
-          );
-          if (toi && (!best || toi.t < best.toi.t)) best = { toi, ca, cb };
+          for (const part of this.convexParts(cb, swept)) {
+            const toi = timeOfImpact(
+              { shape: ca.shape as ConvexShape, transform: ta },
+              part,
+              d,
+              new Vec3(),
+              { target: this.linearSlop, tolerance: 0.25 * this.linearSlop },
+            );
+            if (toi && (!best || toi.t < best.toi.t)) best = { toi, ca, cb };
+          }
         }
       }
       if (!best) {
@@ -683,10 +767,10 @@ export class World {
     // and feeding it back pumps energy into limbs lying on surfaces (measured: 16 m/s forearm
     // whips on a staircase). Free-flying jointed bodies are where the dissipation matters.
     const touching = new Set<RigidBody>();
-    for (const c of this.contacts.values()) {
+    this.forEachContact((c) => {
       touching.add(c.bodyA);
       touching.add(c.bodyB);
-    }
+    });
     for (const [body, [dx, dtheta]] of feedback) {
       if (touching.has(body)) continue;
       for (const [target, delta] of [
@@ -727,12 +811,13 @@ export class World {
   /** Re-runs the pair manifolds for overlapping collider pairs, keeping impulses by feature id. */
   private updateContacts(dt: number): void {
     const changes = this.broadphase.updatePairs();
+    this.lap('broadphase');
     for (const ch of changes) {
       if (ch.kind !== 'end') continue;
       const ca = this.proxyCollider.get(ch.a);
       const cb = this.proxyCollider.get(ch.b);
       if (!ca || !cb) continue;
-      this.contacts.delete(pairKey(ch.a, ch.b));
+      this.dropPair(pairKey(ch.a, ch.b));
       this.emit({ kind: 'end', a: ca, b: cb });
     }
     // Refresh manifolds for every overlapping pair (cheap for tests; a real engine would cache).
@@ -742,11 +827,12 @@ export class World {
       const cb = this.proxyCollider.get(ib);
       if (!ca || !cb) continue;
       if (!this.shouldCollide(ca, cb)) {
-        this.contacts.delete(key);
+        this.dropPair(key);
         continue;
       }
       this.refreshPair(key, ca, cb, dt);
     }
+    this.lap('narrowphase');
   }
 
   private currentPairs(): [number, [number, number]][] {
@@ -761,7 +847,63 @@ export class World {
     return true;
   }
 
+  private dropPair(key: number): void {
+    this.contacts.delete(key);
+    this.meshContacts.delete(key);
+  }
+
+  /** Contacts between a static triangle mesh and a convex collider: one constraint per triangle. */
+  private refreshMeshPair(key: number, ca: Collider, cb: Collider): void {
+    const meshIsA = ca.shape instanceof TriangleMesh;
+    const cm = meshIsA ? ca : cb;
+    const co = meshIsA ? cb : ca;
+    const mesh = cm.shape as TriangleMesh;
+    if (co.shape instanceof TriangleMesh) return;
+    const tm = cm.body.colliderTransform(cm, new Transform());
+    const to = co.body.colliderTransform(co, new Transform());
+    const tris: number[] = [];
+    mesh.bvh.query(toLocalBox(placedBounds(co.shape, to), tm), tris);
+    tris.sort((x, y) => x - y);
+    const subs = this.meshContacts.get(key);
+    const next = new Map<number, ContactConstraint>();
+    const pts: [Vec3, Vec3, Vec3] = [new Vec3(), new Vec3(), new Vec3()];
+    const nTri = new Vec3();
+    for (const tri of tris) {
+      mesh.triangle(tri, pts);
+      const e1 = V.sub(new Vec3(), pts[1], pts[0]);
+      const e2 = V.sub(new Vec3(), pts[2], pts[0]);
+      V.cross(nTri, e1, e2);
+      const area2 = V.length(nTri);
+      if (!(area2 > 1e-12)) continue; // degenerate triangle
+      V.scale(nTri, nTri, 1 / area2);
+      Q.rotate(nTri, tm.q, nTri);
+      const shapeM = { shape: new Triangle(pts[0], pts[1], pts[2]), transform: tm };
+      const shapeO = { shape: co.shape, transform: to };
+      const m = meshIsA ? manifoldOf(shapeM, shapeO) : manifoldOf(shapeO, shapeM);
+      if (!m) continue;
+      // Contacts with an edge or vertex of a triangle can point sideways; those belong to the
+      // neighbouring face, so they are dropped rather than allowed to snag a sliding body.
+      if (Math.abs(V.dot(m.normal, nTri)) < 0.5) continue;
+      const old = subs?.get(tri + 1);
+      const c = this.makeConstraint(ca, cb, m, old, tri + 1);
+      next.set(tri + 1, c);
+      if (!old && (ca.body.awake || cb.body.awake)) {
+        ca.body.wake();
+        cb.body.wake();
+      }
+    }
+    const had = subs !== undefined && subs.size > 0;
+    if (next.size > 0) this.meshContacts.set(key, next);
+    else this.meshContacts.delete(key);
+    if (next.size > 0) this.emit({ kind: had ? 'persist' : 'begin', a: ca, b: cb });
+    else if (had) this.emit({ kind: 'end', a: ca, b: cb });
+  }
+
   private refreshPair(key: number, ca: Collider, cb: Collider, dt: number): void {
+    if (ca.shape instanceof TriangleMesh || cb.shape instanceof TriangleMesh) {
+      this.refreshMeshPair(key, ca, cb);
+      return;
+    }
     const ta = ca.body.colliderTransform(ca, new Transform());
     const tb = cb.body.colliderTransform(cb, new Transform());
     const placedA = { shape: ca.shape, transform: ta };
@@ -777,6 +919,26 @@ export class World {
       }
       return;
     }
+    const c = this.makeConstraint(ca, cb, m, old, 0);
+    if (!old) this.emit({ kind: 'begin', a: ca, b: cb });
+    else this.emit({ kind: 'persist', a: ca, b: cb });
+    this.contacts.set(key, c);
+    // A new contact wakes an island that touches an awake body. Persisting contacts do not wake
+    // anything, so resting stacks can accumulate sleep time.
+    if (!old && (ca.body.awake || cb.body.awake)) {
+      ca.body.wake();
+      cb.body.wake();
+    }
+  }
+
+  /** Builds a solver constraint from a manifold, carrying impulses over from `old` by feature id. */
+  private makeConstraint(
+    ca: Collider,
+    cb: Collider,
+    m: ContactManifold,
+    old: ContactConstraint | undefined,
+    sub: number,
+  ): ContactConstraint {
     const [t1, t2] = tangentBasis(m.normal);
     const points: SolverPoint[] = m.points.map((p) => {
       const prev = old?.points.find((o) => o.id === p.id);
@@ -796,7 +958,7 @@ export class World {
         impulseT2: prev?.impulseT2 ?? 0,
       };
     });
-    const c: ContactConstraint = {
+    return {
       bodyA: ca.body,
       bodyB: cb.body,
       normal: V.copy(new Vec3(), m.normal),
@@ -806,17 +968,9 @@ export class World {
       restitution: Math.max(ca.restitution, cb.restitution),
       points,
       pair: [this.colliderProxy.get(ca) as number, this.colliderProxy.get(cb) as number],
-      normalK: [],
+      sub,
+      normalK: new Float64Array(0),
     };
-    if (!old) this.emit({ kind: 'begin', a: ca, b: cb });
-    else this.emit({ kind: 'persist', a: ca, b: cb });
-    this.contacts.set(key, c);
-    // A new contact wakes an island that touches an awake body. Persisting contacts do not wake
-    // anything, so resting stacks can accumulate sleep time.
-    if (!old && (ca.body.awake || cb.body.awake)) {
-      ca.body.wake();
-      cb.body.wake();
-    }
   }
 
   /**
@@ -874,7 +1028,7 @@ export class World {
       const rb = find(b);
       if (ra !== rb) parent.set(ra, rb);
     };
-    for (const c of this.contacts.values()) link(c.bodyA, c.bodyB);
+    this.forEachContact((c) => link(c.bodyA, c.bodyB));
     for (const j of this.joints) link(j.bodyA, j.bodyB);
     const islandMinSleep = new Map<RigidBody, number>();
     for (const body of this.bodies) {
@@ -897,8 +1051,21 @@ export class World {
   }
 }
 
+/** Bounding box, in the frame of transform `t`, of a world-space box. */
+function toLocalBox(box: AABB, t: Transform): AABB {
+  const out = BB.empty(new AABB());
+  for (const x of [box.min.x, box.max.x]) {
+    for (const y of [box.min.y, box.max.y]) {
+      for (const z of [box.min.z, box.max.z]) {
+        BB.expandPoint(out, T.applyInverse(new Vec3(), t, new Vec3(x, y, z)));
+      }
+    }
+  }
+  return out;
+}
+
 /** World-space bounding box of a convex shape placed at `t`. */
-function placedBounds(shape: ConvexShape, t: Transform): AABB {
+function placedBounds(shape: ColliderShape, t: Transform): AABB {
   const local = shape.localBounds(new AABB());
   const out = BB.empty(new AABB());
   for (const x of [local.min.x, local.max.x]) {

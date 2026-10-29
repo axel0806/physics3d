@@ -1,5 +1,6 @@
 import { describe, it } from 'vitest';
 import fc from 'fast-check';
+import { FC_SEED } from '../helpers/fc';
 import { Vec3, Quat, Mat3, Mat4, Transform } from '../../src/math';
 import * as V from '../../src/math/vec3';
 import * as Q from '../../src/math/quat';
@@ -7,7 +8,7 @@ import * as M3 from '../../src/math/mat3';
 import * as M4 from '../../src/math/mat4';
 import * as T from '../../src/math/transform';
 
-const RUNS = { numRuns: 2000 };
+const RUNS = { numRuns: 2000, seed: FC_SEED };
 const f = fc.double({ min: -100, max: 100, noNaN: true });
 const vec = fc.tuple(f, f, f).map(([x, y, z]) => new Vec3(x, y, z));
 const quat = fc

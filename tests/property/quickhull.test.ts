@@ -1,5 +1,6 @@
 import { describe, it } from 'vitest';
 import fc from 'fast-check';
+import { FC_SEED } from '../helpers/fc';
 import { Vec3 } from '../../src/math';
 import * as V from '../../src/math/vec3';
 import { quickhull, polyhedronMassProperties, type HullData } from '../../src/shapes';
@@ -10,7 +11,7 @@ const cloud = fc.array(
   { minLength: 4, maxLength: 80 },
 );
 
-const RUNS = { numRuns: 1000 };
+const RUNS = { numRuns: 1000, seed: FC_SEED };
 const SCALE = 10;
 /**
  * "On or inside" tolerance. quickhull drops points within its own tolerance (1e-12 × max |coord|),

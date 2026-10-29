@@ -3,6 +3,7 @@ import * as V from '../math/vec3';
 import * as M3 from '../math/mat3';
 import * as Q from '../math/quat';
 import type { ConvexShape } from '../shapes/shape';
+import { TriangleMesh } from '../shapes/mesh';
 import {
   combine,
   transformMassProperties,
@@ -10,12 +11,15 @@ import {
   type MassProperties,
 } from '../shapes/mass';
 
+/** A collider is convex, or a static triangle mesh (non-convex, no mass). */
+export type ColliderShape = ConvexShape | TriangleMesh;
+
 export type BodyType = 'static' | 'kinematic' | 'dynamic';
 
 /** A convex shape attached to a body. `local` is its frame relative to the body's center of mass. */
 export interface Collider {
   readonly body: RigidBody;
-  readonly shape: ConvexShape;
+  readonly shape: ColliderShape;
   readonly local: Transform;
   readonly friction: number;
   readonly restitution: number;
@@ -111,6 +115,9 @@ export class RigidBody {
     }
     const parts: MassProperties[] = [];
     for (const c of this.colliders) {
+      if (c.shape instanceof TriangleMesh) {
+        throw new RangeError('a triangle mesh has no mass: attach it to a static body');
+      }
       const density = 1;
       parts.push(transformMassProperties(c.shape.massProperties(density), c.local));
     }

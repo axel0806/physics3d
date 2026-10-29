@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import fc from 'fast-check';
+import { FC_SEED } from '../helpers/fc';
 import { Vec3, Quat, Mat3, Transform } from '../../src/math';
 import * as Q from '../../src/math/quat';
 import * as M3 from '../../src/math/mat3';
@@ -14,7 +15,7 @@ import {
   type MassProperties,
 } from '../../src/shapes';
 
-const NUM = { numRuns: 300 };
+const NUM = { numRuns: 300, seed: FC_SEED };
 const d = fc.double({ min: -1, max: 1, noNaN: true });
 const quat = fc
   .tuple(d, d, d, d)

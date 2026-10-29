@@ -38,8 +38,10 @@ export interface ContactConstraint {
   readonly points: SolverPoint[];
   /** Broadphase proxy ids of the two colliders (A < B). */
   readonly pair: readonly [number, number];
+  /** 0 for a convex pair; triangle index + 1 for a contact with a mesh triangle. */
+  readonly sub: number;
   /** Normal effective-mass matrix K_ij (coupled across points through rotation). Filled by prepareContact. */
-  normalK: number[][];
+  normalK: Float64Array;
 }
 
 /** Orthonormal tangent basis perpendicular to unit vector n. */
@@ -51,13 +53,33 @@ export function tangentBasis(n: Vec3): [Vec3, Vec3] {
 
 /** Applies a linear impulse P at world offset r from the center of mass. */
 export function applyImpulse(body: RigidBody, P: Vec3, r: Vec3): void {
+  applyImpulseXYZ(body, P.x, P.y, P.z, r.x, r.y, r.z);
+}
+
+/** Same as `applyImpulse` with scalar arguments (no allocation). */
+export function applyImpulseXYZ(
+  body: RigidBody,
+  px: number,
+  py: number,
+  pz: number,
+  rx: number,
+  ry: number,
+  rz: number,
+): void {
   if (!body.isSimulated) return;
-  body.linearVelocity.x += P.x * body.invMass;
-  body.linearVelocity.y += P.y * body.invMass;
-  body.linearVelocity.z += P.z * body.invMass;
-  const torque = V.cross(new Vec3(), r, P);
-  const dw = M3.mulVec(new Vec3(), body.worldInvInertia, torque);
-  V.add(body.angularVelocity, body.angularVelocity, dw);
+  const im = body.invMass;
+  const lv = body.linearVelocity;
+  lv.x += px * im;
+  lv.y += py * im;
+  lv.z += pz * im;
+  const tx = ry * pz - rz * py;
+  const ty = rz * px - rx * pz;
+  const tz = rx * py - ry * px;
+  const e = body.worldInvInertia.e;
+  const av = body.angularVelocity;
+  av.x += (e[0] as number) * tx + (e[1] as number) * ty + (e[2] as number) * tz;
+  av.y += (e[3] as number) * tx + (e[4] as number) * ty + (e[5] as number) * tz;
+  av.z += (e[6] as number) * tx + (e[7] as number) * ty + (e[8] as number) * tz;
 }
 
 /** Effective inverse mass of the pair along unit direction d at offsets rA and rB. */
@@ -110,33 +132,47 @@ export function buildNormalK(c: ContactConstraint): void {
   // Four coplanar points have a rank-3 matrix (translation and two rotations), so the complementarity
   // problem has a family of solutions and the solver would pick an arbitrary, asymmetric one. A tiny
   // Tikhonov term selects the symmetric, minimum-norm solution without changing the physics.
+  const n = c.points.length;
   let maxDiag = 0;
-  c.normalK.forEach((row, i) => (maxDiag = Math.max(maxDiag, row[i] ?? 0)));
+  for (let i = 0; i < n; i++) maxDiag = Math.max(maxDiag, c.normalK[i * n + i] as number);
   const eps = 1e-9 * maxDiag;
-  c.normalK.forEach((row, i) => (row[i] = (row[i] ?? 0) + eps));
+  for (let i = 0; i < n; i++) c.normalK[i * n + i] = (c.normalK[i * n + i] as number) + eps;
 }
 
 function buildNormalKRaw(c: ContactConstraint): void {
-  const n = c.normal;
+  const n = c.points.length;
+  if (c.normalK.length !== n * n) c.normalK = new Float64Array(n * n);
+  const nr = c.normal;
   const a = c.bodyA;
   const b = c.bodyB;
-  const cross = (r: Vec3) => V.cross(new Vec3(), r, n);
-  const ca = c.points.map((p) => cross(p.rA));
-  const cb = c.points.map((p) => cross(p.rB));
-  const ia = ca.map((v) =>
-    a.isSimulated ? M3.mulVec(new Vec3(), a.worldInvInertia, v) : new Vec3(),
-  );
-  const ib = cb.map((v) =>
-    b.isSimulated ? M3.mulVec(new Vec3(), b.worldInvInertia, v) : new Vec3(),
-  );
-  c.normalK = c.points.map((_, i) =>
-    c.points.map((_, j) => {
-      let k = (a.isSimulated ? a.invMass : 0) + (b.isSimulated ? b.invMass : 0);
-      if (a.isSimulated) k += V.dot(ca[i] as Vec3, ia[j] as Vec3);
-      if (b.isSimulated) k += V.dot(cb[i] as Vec3, ib[j] as Vec3);
-      return k;
-    }),
-  );
+  const aSim = a.isSimulated;
+  const bSim = b.isSimulated;
+  const base = (aSim ? a.invMass : 0) + (bSim ? b.invMass : 0);
+  const K = c.normalK;
+  for (let i = 0; i < n; i++) {
+    const pi = c.points[i] as SolverPoint;
+    for (let j = 0; j < n; j++) {
+      const pj = c.points[j] as SolverPoint;
+      let k = base;
+      if (aSim) k += crossDot(a.worldInvInertia.e, pi.rA, pj.rA, nr);
+      if (bSim) k += crossDot(b.worldInvInertia.e, pi.rB, pj.rB, nr);
+      K[i * n + j] = k;
+    }
+  }
+}
+
+/** (r1 × n) · I (r2 × n) for a 3x3 row-major I. */
+function crossDot(e: Float64Array, r1: Vec3, r2: Vec3, n: Vec3): number {
+  const ax = r1.y * n.z - r1.z * n.y;
+  const ay = r1.z * n.x - r1.x * n.z;
+  const az = r1.x * n.y - r1.y * n.x;
+  const bx = r2.y * n.z - r2.z * n.y;
+  const by = r2.z * n.x - r2.x * n.z;
+  const bz = r2.x * n.y - r2.y * n.x;
+  const ix = (e[0] as number) * bx + (e[1] as number) * by + (e[2] as number) * bz;
+  const iy = (e[3] as number) * bx + (e[4] as number) * by + (e[5] as number) * bz;
+  const iz = (e[6] as number) * bx + (e[7] as number) * by + (e[8] as number) * bz;
+  return ax * ix + ay * iy + az * iz;
 }
 
 function invOrZero(k: number): number {
@@ -167,19 +203,16 @@ function impulseVector(c: ContactConstraint, n: number, t1: number, t2: number):
  * saturate and pitch the body.
  */
 export function solveVelocity(c: ContactConstraint): void {
-  const a = c.bodyA;
-  const b = c.bodyB;
+  const n = c.normal;
   if (c.points.length > 1 && solveNormalBlock(c)) {
     // Block solution applied: impulses already updated.
   } else {
     for (const p of c.points) {
-      const vn = normalSpeedAt(c, p);
+      const vn = relativeSpeed(c, p, n.x, n.y, n.z);
       const next = Math.max(0, p.impulseN + (p.restitutionTarget - vn) * p.normalMass);
       const dn = next - p.impulseN;
       p.impulseN = next;
-      const Pn = V.scale(new Vec3(), c.normal, dn);
-      applyImpulse(a, V.negate(new Vec3(), Pn), p.rA);
-      applyImpulse(b, Pn, p.rB);
+      applyPair(c, p, n.x * dn, n.y * dn, n.z * dn);
     }
   }
   for (const p of c.points) {
@@ -188,6 +221,13 @@ export function solveVelocity(c: ContactConstraint): void {
     solveTangent(c, p, c.tangent2, maxF, 2);
   }
 }
+
+/** Scratch for the block solve; manifolds have at most MAX_BLOCK points, larger ones fall back. */
+const MAX_BLOCK = 4;
+const BLK_Q = new Float64Array(MAX_BLOCK);
+const BLK_LAM = new Float64Array(MAX_BLOCK);
+const BLK_S = new Int32Array(MAX_BLOCK);
+const BLK_M = new Float64Array(MAX_BLOCK * (MAX_BLOCK + 1));
 
 /**
  * Solves the normal impulses of a multi-point manifold as a linear complementarity problem:
@@ -198,80 +238,94 @@ export function solveVelocity(c: ContactConstraint): void {
 function solveNormalBlock(c: ContactConstraint): boolean {
   const pts = c.points;
   const n = pts.length;
+  if (n > MAX_BLOCK) return false;
   const K = c.normalK;
-  const lamOld = pts.map((p) => p.impulseN);
-  const q = pts.map((p, i) => {
+  const nrm = c.normal;
+  for (let i = 0; i < n; i++) {
+    const p = pts[i] as SolverPoint;
     let kl = 0;
-    for (let j = 0; j < n; j++) kl += (K[i]?.[j] ?? 0) * (lamOld[j] ?? 0);
-    return normalSpeedAt(c, p) - p.restitutionTarget - kl;
-  });
+    for (let j = 0; j < n; j++) kl += (K[i * n + j] as number) * (pts[j] as SolverPoint).impulseN;
+    BLK_Q[i] = relativeSpeed(c, p, nrm.x, nrm.y, nrm.z) - p.restitutionTarget - kl;
+  }
   const EPS = 1e-12;
   for (let mask = (1 << n) - 1; mask >= 0; mask--) {
-    const S: number[] = [];
-    for (let i = 0; i < n; i++) if (mask & (1 << i)) S.push(i);
-    const lam = new Array<number>(n).fill(0);
-    if (S.length > 0) {
-      const A = S.map((i) => S.map((j) => K[i]?.[j] ?? 0));
-      const rhs = S.map((i) => -(q[i] ?? 0));
-      const x = solveDense(A, rhs);
-      if (!x) continue;
+    let m = 0;
+    for (let i = 0; i < n; i++) if (mask & (1 << i)) BLK_S[m++] = i;
+    BLK_LAM.fill(0, 0, n);
+    if (m > 0) {
+      for (let r = 0; r < m; r++) {
+        const si = BLK_S[r] as number;
+        for (let k = 0; k < m; k++) {
+          BLK_M[r * (m + 1) + k] = K[si * n + (BLK_S[k] as number)] as number;
+        }
+        BLK_M[r * (m + 1) + m] = -(BLK_Q[si] as number);
+      }
+      if (!eliminate(m)) continue;
       let ok = true;
-      S.forEach((i, k) => {
-        const v = x[k] ?? 0;
+      for (let k = 0; k < m; k++) {
+        const v = BLK_M[k * (m + 1) + m] as number;
         if (v < -EPS) ok = false;
-        lam[i] = Math.max(0, v);
-      });
+        BLK_LAM[BLK_S[k] as number] = Math.max(0, v);
+      }
       if (!ok) continue;
     }
     // Check w = Kλ + q ≥ 0 on the inactive set.
     let feasible = true;
     for (let i = 0; i < n && feasible; i++) {
-      if (S.includes(i)) continue;
-      let w = q[i] ?? 0;
-      for (let j = 0; j < n; j++) w += (K[i]?.[j] ?? 0) * lam[j]!;
+      if (mask & (1 << i)) continue;
+      let w = BLK_Q[i] as number;
+      for (let j = 0; j < n; j++) w += (K[i * n + j] as number) * (BLK_LAM[j] as number);
       if (w < -1e-9) feasible = false;
     }
     if (!feasible) continue;
     // Apply the incremental impulses.
     for (let i = 0; i < n; i++) {
       const p = pts[i] as SolverPoint;
-      const d = (lam[i] ?? 0) - (p.impulseN ?? 0);
-      p.impulseN = lam[i] ?? 0;
-      const P = V.scale(new Vec3(), c.normal, d);
-      applyImpulse(c.bodyA, V.negate(new Vec3(), P), p.rA);
-      applyImpulse(c.bodyB, P, p.rB);
+      const lam = BLK_LAM[i] as number;
+      const d = lam - p.impulseN;
+      p.impulseN = lam;
+      applyPair(c, p, nrm.x * d, nrm.y * d, nrm.z * d);
     }
     return true;
   }
   return false;
 }
 
-/** Dense Gaussian elimination with partial pivoting for the tiny block systems; null if singular. */
-function solveDense(Ain: number[][], bin: number[]): number[] | null {
-  const n = bin.length;
-  const M = Ain.map((row, i) => [...row, bin[i] ?? 0]);
-  for (let c = 0; c < n; c++) {
-    let piv = c;
-    for (let r = c + 1; r < n; r++)
-      if (Math.abs(M[r]?.[c] ?? 0) > Math.abs(M[piv]?.[c] ?? 0)) piv = r;
-    const pr = M[piv] ?? [];
-    if (Math.abs(pr[c] ?? 0) < 1e-14) return null;
-    M[piv] = M[c] ?? [];
-    M[c] = pr;
-    for (let r = c + 1; r < n; r++) {
-      const row = M[r] ?? [];
-      const f = (row[c] ?? 0) / (pr[c] ?? 1);
-      for (let k = c; k <= n; k++) row[k] = (row[k] ?? 0) - f * (pr[k] ?? 0);
+/**
+ * Gaussian elimination with partial pivoting on the augmented m×(m+1) system in BLK_M; the
+ * solution is left in the last column. Returns false if singular.
+ */
+function eliminate(m: number): boolean {
+  const w = m + 1;
+  for (let col = 0; col < m; col++) {
+    let piv = col;
+    for (let r = col + 1; r < m; r++) {
+      if (Math.abs(BLK_M[r * w + col] as number) > Math.abs(BLK_M[piv * w + col] as number))
+        piv = r;
+    }
+    if (Math.abs(BLK_M[piv * w + col] as number) < 1e-14) return false;
+    if (piv !== col) {
+      for (let k = 0; k < w; k++) {
+        const t = BLK_M[col * w + k] as number;
+        BLK_M[col * w + k] = BLK_M[piv * w + k] as number;
+        BLK_M[piv * w + k] = t;
+      }
+    }
+    const pc = BLK_M[col * w + col] as number;
+    for (let r = col + 1; r < m; r++) {
+      const f = (BLK_M[r * w + col] as number) / pc;
+      for (let k = col; k <= m; k++) {
+        BLK_M[r * w + k] = (BLK_M[r * w + k] as number) - f * (BLK_M[col * w + k] as number);
+      }
     }
   }
-  const x = new Array<number>(n).fill(0);
-  for (let r = n - 1; r >= 0; r--) {
-    const row = M[r] ?? [];
-    let s = row[n] ?? 0;
-    for (let k = r + 1; k < n; k++) s -= (row[k] ?? 0) * (x[k] ?? 0);
-    x[r] = s / (row[r] ?? 1);
+  for (let r = m - 1; r >= 0; r--) {
+    let s = BLK_M[r * w + m] as number;
+    for (let k = r + 1; k < m; k++)
+      s -= (BLK_M[r * w + k] as number) * (BLK_M[k * w + m] as number);
+    BLK_M[r * w + m] = s / (BLK_M[r * w + r] as number);
   }
-  return x;
+  return true;
 }
 
 /** Solves one friction direction at a point, clamped to the Coulomb bound. `which` picks the stored accumulator. */
@@ -284,42 +338,76 @@ function solveTangent(
 ): void {
   const mass = which === 1 ? p.tangentMass1 : p.tangentMass2;
   const acc = which === 1 ? p.impulseT1 : p.impulseT2;
-  const vt = tangentSpeedAt(c, p, t);
+  const vt = relativeSpeed(c, p, t.x, t.y, t.z);
   const next = Math.max(-maxF, Math.min(maxF, acc - vt * mass));
   const d = next - acc;
   if (which === 1) p.impulseT1 = next;
   else p.impulseT2 = next;
-  const P = V.scale(new Vec3(), t, d);
-  applyImpulse(c.bodyA, V.negate(new Vec3(), P), p.rA);
-  applyImpulse(c.bodyB, P, p.rB);
+  applyPair(c, p, t.x * d, t.y * d, t.z * d);
+}
+
+/** Applies +P to body B and −P to body A at the point's offsets. */
+function applyPair(c: ContactConstraint, p: SolverPoint, px: number, py: number, pz: number): void {
+  applyImpulseXYZ(c.bodyA, -px, -py, -pz, p.rA.x, p.rA.y, p.rA.z);
+  applyImpulseXYZ(c.bodyB, px, py, pz, p.rB.x, p.rB.y, p.rB.z);
 }
 
 /** Normal speed of B relative to A at a contact point, from the velocities at the start of the step. */
 function startNormalSpeedAt(c: ContactConstraint, p: SolverPoint): number {
-  const vA = pointVelocity(c.bodyA.stepStartLinear, c.bodyA.stepStartAngular, p.rA);
-  const vB = pointVelocity(c.bodyB.stepStartLinear, c.bodyB.stepStartAngular, p.rB);
-  return V.dot(V.sub(new Vec3(), vB, vA), c.normal);
+  const a = c.bodyA;
+  const b = c.bodyB;
+  return speedAlong(
+    a.stepStartLinear,
+    a.stepStartAngular,
+    b.stepStartLinear,
+    b.stepStartAngular,
+    p,
+    c.normal.x,
+    c.normal.y,
+    c.normal.z,
+  );
 }
 
-function pointVelocity(v: Vec3, w: Vec3, r: Vec3): Vec3 {
-  return new Vec3(
-    v.x + (w.y * r.z - w.z * r.y),
-    v.y + (w.z * r.x - w.x * r.z),
-    v.z + (w.x * r.y - w.y * r.x),
+/** Speed of B relative to A at a contact point along (dx, dy, dz), from the current velocities. */
+function relativeSpeed(c: ContactConstraint, p: SolverPoint, dx: number, dy: number, dz: number) {
+  const a = c.bodyA;
+  const b = c.bodyB;
+  return speedAlong(
+    a.linearVelocity,
+    a.angularVelocity,
+    b.linearVelocity,
+    b.angularVelocity,
+    p,
+    dx,
+    dy,
+    dz,
   );
+}
+
+function speedAlong(
+  la: Vec3,
+  wa: Vec3,
+  lb: Vec3,
+  wb: Vec3,
+  p: SolverPoint,
+  dx: number,
+  dy: number,
+  dz: number,
+): number {
+  const r = p.rA;
+  const s = p.rB;
+  const vax = la.x + (wa.y * r.z - wa.z * r.y);
+  const vay = la.y + (wa.z * r.x - wa.x * r.z);
+  const vaz = la.z + (wa.x * r.y - wa.y * r.x);
+  const vbx = lb.x + (wb.y * s.z - wb.z * s.y);
+  const vby = lb.y + (wb.z * s.x - wb.x * s.z);
+  const vbz = lb.z + (wb.x * s.y - wb.y * s.x);
+  return (vbx - vax) * dx + (vby - vay) * dy + (vbz - vaz) * dz;
 }
 
 /** Normal speed of B relative to A at a contact point. */
 export function normalSpeedAt(c: ContactConstraint, p: SolverPoint): number {
-  const vA = c.bodyA.velocityAt(p.rA, new Vec3());
-  const vB = c.bodyB.velocityAt(p.rB, new Vec3());
-  return V.dot(V.sub(new Vec3(), vB, vA), c.normal);
-}
-
-function tangentSpeedAt(c: ContactConstraint, p: SolverPoint, t: Vec3): number {
-  const vA = c.bodyA.velocityAt(p.rA, new Vec3());
-  const vB = c.bodyB.velocityAt(p.rB, new Vec3());
-  return V.dot(V.sub(new Vec3(), vB, vA), t);
+  return relativeSpeed(c, p, c.normal.x, c.normal.y, c.normal.z);
 }
 
 /**

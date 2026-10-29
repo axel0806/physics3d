@@ -18,6 +18,46 @@ interface Face {
   visible: boolean;
 }
 
+/** Relative distance under which input points count as the same point. */
+const MERGE = 1e-10;
+
+/** Drops each point lying within `eps` (Euclidean) of an earlier kept point; input order is kept. */
+function mergeNearDuplicates(points: readonly Vec3[], eps: number): Vec3[] {
+  if (!(eps > 0)) return [...points];
+  const cell = (v: number) => Math.floor(v / (2 * eps));
+  const grid = new Map<string, Vec3[]>();
+  const kept: Vec3[] = [];
+  const eps2 = eps * eps;
+  for (const p of points) {
+    const cx = cell(p.x);
+    const cy = cell(p.y);
+    const cz = cell(p.z);
+    let dup = false;
+    for (let dx = -1; dx <= 1 && !dup; dx++) {
+      for (let dy = -1; dy <= 1 && !dup; dy++) {
+        for (let dz = -1; dz <= 1 && !dup; dz++) {
+          for (const q of grid.get(`${cx + dx},${cy + dy},${cz + dz}`) ?? []) {
+            const ex = p.x - q.x;
+            const ey = p.y - q.y;
+            const ez = p.z - q.z;
+            if (ex * ex + ey * ey + ez * ez <= eps2) {
+              dup = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (dup) continue;
+    kept.push(p);
+    const key = `${cx},${cy},${cz}`;
+    const bucket = grid.get(key);
+    if (bucket) bucket.push(p);
+    else grid.set(key, [p]);
+  }
+  return kept;
+}
+
 /**
  * 3D quickhull (Barber, Dobkin & Huhdanpaa). Faces keep outside-point lists; each iteration
  * adds the farthest outside point, deletes the faces it can see, and stitches new faces to
@@ -25,10 +65,15 @@ interface Face {
  */
 export function quickhull(points: readonly Vec3[]): HullData {
   if (points.length < 4) throw new RangeError('quickhull needs at least 4 points');
-  const pts = points;
   let scale = 0;
-  for (const p of pts) scale = Math.max(scale, Math.abs(p.x), Math.abs(p.y), Math.abs(p.z));
+  for (const p of points) scale = Math.max(scale, Math.abs(p.x), Math.abs(p.y), Math.abs(p.z));
   const tol = 1e-12 * scale;
+  // Points closer than MERGE × scale add nothing the hull's own tolerance can resolve, and
+  // clusters of them (imported meshes repeat vertices) make the face planes through them
+  // arbitrary: a random run produced a hull missing an input point by 6% of its size. Keep the
+  // first of each cluster; the dropped points lie within MERGE × scale of a kept one.
+  const pts = mergeNearDuplicates(points, MERGE * scale);
+  if (pts.length < 4) throw new RangeError('degenerate hull: fewer than 4 distinct points');
 
   // Initial simplex from extreme points.
   const { i0, i1, i2, i3 } = initialSimplex(pts, tol);
