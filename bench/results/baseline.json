@@ -1,67 +1,67 @@
 {
   "node": "v26.8.2",
-  "date": "2026-10-29T17:26:29.108Z",
+  "date": "2026-10-29T18:51:27.009Z",
   "results": [
     {
       "scene": "pile-1000-boxes",
       "bodies": 1005,
       "steps": 300,
-      "medianMs": 39.682299999999486,
-      "p99Ms": 53.33969999999999,
-      "maxMs": 64.38550000000032,
+      "medianMs": 17.348899999999958,
+      "p99Ms": 34.59620000000041,
+      "maxMs": 35.42689999999993,
       "phases": {
-        "broadphase": 1.4666999999999462,
-        "narrowphase": 15.855000000001382,
-        "solve": 15.77310000000034,
-        "integrate": 6.080199999999422
+        "broadphase": 0.4337999999997919,
+        "narrowphase": 7.708300000000236,
+        "solve": 8.390000000000327,
+        "integrate": 0.8593000000009852
       },
-      "contactsAtEnd": 1576,
-      "awakeAtEnd": 535
+      "contactsAtEnd": 41,
+      "awakeAtEnd": 9
     },
     {
       "scene": "pile-2000-spheres",
       "bodies": 2005,
       "steps": 300,
-      "medianMs": 39.28229999999894,
-      "p99Ms": 143.25990000000093,
-      "maxMs": 179.67439999999988,
+      "medianMs": 16.36319999999978,
+      "p99Ms": 124.76100000000042,
+      "maxMs": 351.97520000000077,
       "phases": {
-        "broadphase": 0.5320999999967171,
-        "narrowphase": 31.410399999993388,
-        "solve": 7.217499999998836,
-        "integrate": 1.7085000000006403
+        "broadphase": 0.2613000000001193,
+        "narrowphase": 12.725699999999051,
+        "solve": 1.9654000000009546,
+        "integrate": 0.7461000000002969
       },
-      "contactsAtEnd": 509,
-      "awakeAtEnd": 99
+      "contactsAtEnd": 542,
+      "awakeAtEnd": 105
     },
     {
       "scene": "ragdolls-100",
       "bodies": 1005,
       "steps": 300,
-      "medianMs": 141.8888999999981,
-      "p99Ms": 251.6724000000031,
-      "maxMs": 255.63070000000153,
+      "medianMs": 167.09530000000086,
+      "p99Ms": 216.5702999999994,
+      "maxMs": 223.62739999999758,
       "phases": {
-        "broadphase": 1.6880000000019209,
-        "narrowphase": 59.54979999999341,
-        "solve": 73.63820000000123,
-        "integrate": 6.7339000000065425
+        "broadphase": 0.6661999999996624,
+        "narrowphase": 63.38230000000476,
+        "solve": 100.84269999999378,
+        "integrate": 1.661500000001979
       },
-      "contactsAtEnd": 674,
-      "awakeAtEnd": 910
+      "contactsAtEnd": 652,
+      "awakeAtEnd": 870
     },
     {
       "scene": "stacks-30x30",
       "bodies": 3601,
       "steps": 300,
-      "medianMs": 0.6615000000019791,
-      "p99Ms": 1.8352999999915482,
-      "maxMs": 2.691500000000815,
+      "medianMs": 0.7653999999893131,
+      "p99Ms": 1.9461000000010245,
+      "maxMs": 2.1525000000110595,
       "phases": {
-        "broadphase": 0.07529999999678694,
-        "narrowphase": 0.45200000000477303,
-        "solve": 0.002199999988079071,
-        "integrate": 0.12769999999727588
+        "broadphase": 0.1264999999984866,
+        "narrowphase": 0.2933999999950174,
+        "solve": 0.004899999999906868,
+        "integrate": 0.3264000000199303
       },
       "contactsAtEnd": 0,
       "awakeAtEnd": 0
@@ -70,17 +70,17 @@
       "scene": "terrain-500",
       "bodies": 501,
       "steps": 300,
-      "medianMs": 278.85139999999956,
-      "p99Ms": 411.8084999999992,
-      "maxMs": 424.8292999999976,
+      "medianMs": 293.1808000000019,
+      "p99Ms": 429.5546999999933,
+      "maxMs": 438.23649999999907,
       "phases": {
-        "broadphase": 0.7479999999923166,
-        "narrowphase": 265.20819999999367,
-        "solve": 10.142199999972945,
-        "integrate": 2.390700000047218
+        "broadphase": 0.42269999999552965,
+        "narrowphase": 286.3521999999939,
+        "solve": 5.068299999984447,
+        "integrate": 0.5829000000085216
       },
-      "contactsAtEnd": 766,
-      "awakeAtEnd": 170
+      "contactsAtEnd": 489,
+      "awakeAtEnd": 121
     }
   ]
 }

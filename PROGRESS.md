@@ -3,18 +3,22 @@
 ## Current status
 
 **Phases 0-10 are implemented and tested; Phase 11 (final audit) is done. Not COMPLETE:** one
-acceptance criterion is **not met**: the plan's 8 ms median for the 1,000-box pile. Measured now:
-40 ms median (was 88 ms at the start of Phase 11, 191 ms before Phase 9); narrowphase 16 ms, solve
-16 ms, integrate 6 ms, broadphase 1.5 ms, with about 535 of 1,000 bodies awake. The solver alone
-cannot reach 8 ms (floor about 14 ms at 6 iterations); it needs SIMD/Wasm or multithreading, or a
-pile that sleeps completely (the 1,000-box pile is about 96% asleep after 20 s; the 400-box arena
-sleeps fully at about 12 s). Everything else in the plan has an automated check.
+acceptance criterion is **not met**: the plan's 8 ms median for the 1,000-box pile. Measured on a
+quiet machine: **17.4 ms** median (88 ms at the start of Phase 11, 191 ms before Phase 9), made of
+narrowphase 7.7 ms, solve 8.4 ms, integrate 0.9 ms, broadphase 0.4 ms; 9 of 1,000 bodies awake at the
+end of the run. The pile is 46-60% awake in the first seconds, which is where the median sits.
+Remaining levers: split-impulse or soft position correction so the pile settles sooner (the
+solver agent measured 4.6 ms with position correction off, but boxes then interpenetrate by up to
+0.5 m), manifold reuse for resting pairs (conflicts with bit-exact restore), SIMD/Wasm or workers.
+Everything else in the plan has an automated check.
 
-Last full verification (all green): `tsc`, `eslint .`, 211 tests (plus 1 expected fail), 100k-sample
-narrowphase accuracy run (170 s), `bench:check` against the re-recorded baseline, `bench:alloc` (no
-retained growth in any scene), and the 19-scene browser smoke test. Benchmark medians (ms): pile-1000-boxes
-40, pile-2000-spheres 39, ragdolls-100 142, stacks-30x30 0.7, terrain-500 279 (single runs are noisy
-by about 10%; the baseline was recorded on a quiet machine).
+Last full verification on the final tree (all green): `tsc`, `eslint .`, 212 tests (plus 1 expected
+fail), the 100k-sample narrowphase accuracy run (194 s), the 500-drop ragdoll test, `bench:check`
+against the re-recorded baseline, `bench:alloc` (no retained growth in any scene) and the 19-scene
+browser smoke test. Benchmark medians (ms): pile-1000-boxes 17.4, pile-2000-spheres 16.4,
+ragdolls-100 167, stacks-30x30 0.8, terrain-500 293. Wall-clock drift on this machine is up to
+25% between sessions, so the baseline was re-recorded in the same session as the check. Not
+verified: "60 fps in Chrome" (software rendering only).
 
 ## Phase status
 
