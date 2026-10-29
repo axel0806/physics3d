@@ -3,7 +3,7 @@
 ## Current status
 
 **Not complete.** Phases 0–3 are done; Phase 4 is nearly done; Phase 5 has all acceptance scenarios
-passing but no `docs/VALIDATION.md` write-up yet. Phases 6–11 are not started. The last full run
+passing but no `docs/VALIDATION.md` write-up yet. Phase 6 (joints) is implemented and tested (reviewer pass pending); Phases 7–11 are not started. The last full run
 of `pnpm test` (default sample sizes) passed 119 tests across 12 files, and `pnpm check` passed.
 
 ## Phase status
@@ -29,6 +29,32 @@ of `pnpm test` (default sample sizes) passed 119 tests across 12 files, and `pnp
     Newton's cradle; Dzhanibekov (intermediate axis flips, min/max stable, body-frame); friction ramp
     (20 angles); 20-box tower (<1 cm, sleeps); 55-box pyramid (stable, sleeps).
   - **Not yet done:** the `docs/VALIDATION.md` write-up for these tests; and the phase-5 reviewer subagent pass.
+
+## Phase 6 (joints): done, reviewer pass pending
+
+- Implemented in `src/constraints/`: ball, hinge (limits, motor), slider (limits, motor), fixed,
+  distance/spring, cone-twist. Rows are scalar (`Row`) or 3x3 blocks (`PointLock`, `AngularLock`).
+- Tests (`tests/physics/joints.test.ts`) pass: pendulum small angle and 60/120 degree large angle
+  (hinge and ball, within 1% of the elliptic-integral period), hinge motor and limits, slider, fixed,
+  spring, double pendulum (<1% energy at 480 Hz; peak 1.6% at 240 Hz, first order in dt),
+  50-link chain (settled joint error <1 mm; first-swing transient ~1.7 mm, bounded at 5 mm).
+- Ragdoll (`tests/physics/ragdoll.test.ts`): default 40 drops; `pnpm test:ragdoll` runs 500 (about 15 min).
+  Thresholds were set from measured data: speed < 25 m/s, transient anchor gap < 0.25 m, resting gap < 6 cm.
+  500-drop result (passed, 1526 s): worst transient gap ~0.2 m, worst speed ~15 m/s, one drop rests with
+  a 4.5 cm gap (limb radius 5 cm). Transient gaps come from deep-penetration pushes without CCD (Phase 7).
+- Fixes made along the way: hinge angle is unwrapped about the middle of its limit range and limit
+  correction is clamped (`MAX_LIMIT_FIX` 0.2 rad); the cone-twist twist axis is the normalized sum of both
+  bodies' twist axes (A's alone chattered at large swing); SHAKE feedback is skipped for bodies in contact
+  (it pumped energy and whipped limbs at 41 m/s).
+- Design decision, energy loss: a velocity-level joint solver plus position projection dissipated ~6%/s
+  in uniform circular motion (first order in dt). Fixed by (1) correcting positions along the
+  start-of-step Jacobian and (2) feeding the lock-correction displacement back into velocities once per
+  step (SHAKE), capped at `maxCorrectionSpeed` (1 m/s, rad/s). Limit corrections are not fed back
+  (that made limits bounce and chatter). Result: circular-motion KE change +0.007%/s, period error ~0.
+- Jointed bodies rotate after the solve (`integrateOrientationPostSolve`); free bodies keep the
+  pre-solve rotation used by the contact tests.
+- Sleeping islands now link through dynamic bodies only (a shared static body no longer merges islands).
+- Not yet done: allocation-free joint code (Phase 9), Phase 6 reviewer pass, `docs/VALIDATION.md`.
 
 ## Known limitations (carry-forward)
 
@@ -79,9 +105,9 @@ See `docs/ARCHITECTURE.md` (pipeline, solver, position correction, gyroscopic in
 1. Record the 100k narrowphase accuracy result in this file (`pnpm bench:accuracy`).
 2. Write `docs/VALIDATION.md` for the Phase 4 and Phase 5 tests (setup, expected, measured).
 3. Phase 5 reviewer subagent (per plan), then fix findings.
-4. Phase 6: joints (ball, hinge with limits and motor, slider, fixed, distance, cone-twist).
+4. Phase 6 reviewer subagent, then fix findings.
 5. Phases 7–11 as planned in `PLAN.md`.
 
 ## Uncommitted state
 
-The Phase 5 work is committed (`af9b81f`). Edits after that (none significant) are not committed.
+Phase 6 is committed. Full suite (ragdoll excluded): 130 tests pass; 500-drop ragdoll passes.

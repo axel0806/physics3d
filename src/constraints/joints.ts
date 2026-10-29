@@ -5,6 +5,8 @@ import type { RigidBody } from '../dynamics/body';
 import { AngularLock, Joint, PointLock, Row, basis, localDir, localPoint, worldDir } from './joint';
 
 const BETA = () => Joint.beta;
+/** Largest angular limit violation (rad) corrected in one NGS iteration. */
+const MAX_LIMIT_FIX = 0.2;
 
 /** Ball-and-socket: the two anchor points coincide. Three translational DOF locked. */
 export class BallJoint extends Joint {
@@ -138,7 +140,12 @@ export class HingeJoint extends Joint {
     const aA = worldDir(this.bodyA, this.axisA);
     const uA = worldDir(this.bodyA, this.refA);
     const uB = worldDir(this.bodyB, this.refB);
-    return Math.atan2(V.dot(V.cross(new Vec3(), uA, uB), aA), V.dot(uA, uB));
+    const raw = Math.atan2(V.dot(V.cross(new Vec3(), uA, uB), aA), V.dot(uA, uB));
+    if (!this.enableLimit) return raw;
+    // Unwrap about the middle of the allowed range, so a pose just past a limit is corrected
+    // the short way round instead of by almost a full turn the wrong way.
+    const mid = 0.5 * (this.lower + this.upper);
+    return mid + Math.atan2(Math.sin(raw - mid), Math.cos(raw - mid));
   }
 
   prepare(dt: number): void {
@@ -226,8 +233,8 @@ export class HingeJoint extends Joint {
     if (this.enableLimit) {
       const theta = this.measureAngle();
       const axis = worldDir(a, this.axisA);
-      const low = Math.min(0, theta - this.lower + Joint.angularSlop);
-      const high = Math.min(0, this.upper - theta + Joint.angularSlop);
+      const low = Math.max(-MAX_LIMIT_FIX, Math.min(0, theta - this.lower + Joint.angularSlop));
+      const high = Math.max(-MAX_LIMIT_FIX, Math.min(0, this.upper - theta + Joint.angularSlop));
       if (low < 0) {
         this.lowerRow.setAngular(a, b, axis);
         this.lowerRow.position(a, b, low, BETA());
@@ -566,7 +573,16 @@ export class ConeTwistJoint extends Joint {
       twist,
       swingAngle,
       swingAxis: Q.rotate(new Vec3(), fa, swingAxisLocal),
-      twistAxis: Q.rotate(new Vec3(), fa, new Vec3(1, 0, 0)),
+      // Midway between the two bodies' twist axes: with a large swing, A's axis alone is not the
+      // axis the twist angle changes about, and the limit chatters between swing and twist.
+      twistAxis: V.normalize(
+        new Vec3(),
+        V.add(
+          new Vec3(),
+          Q.rotate(new Vec3(), fa, new Vec3(1, 0, 0)),
+          Q.rotate(new Vec3(), fb, new Vec3(1, 0, 0)),
+        ),
+      ),
     };
   }
 

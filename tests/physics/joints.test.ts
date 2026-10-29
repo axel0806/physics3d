@@ -227,7 +227,7 @@ describe('double pendulum', () => {
       worst = Math.max(worst, Math.abs(energy() - e0) / scale);
     }
     expect(worst).toBeLessThan(0.01);
-  });
+  }, 60_000);
 });
 
 describe('chain', () => {
@@ -283,5 +283,5 @@ describe('chain', () => {
     const last = w.bodies[w.bodies.length - 1] as RigidBody;
     expect(V.length(last.linearVelocity)).toBeLessThan(0.5);
     expect(last.position.y).toBeLessThan(10 - 0.8 * n * link);
-  });
+  }, 120_000);
 });

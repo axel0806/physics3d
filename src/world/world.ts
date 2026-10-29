@@ -237,7 +237,16 @@ export class World {
   }
 
   private applyFeedback(feedback: Map<RigidBody, [Vec3, Vec3]>, dt: number): void {
+    // Bodies in contact are skipped: there the joint displacement is tangled with contact pushes,
+    // and feeding it back pumps energy into limbs lying on surfaces (measured: 16 m/s forearm
+    // whips on a staircase). Free-flying jointed bodies are where the dissipation matters.
+    const touching = new Set<RigidBody>();
+    for (const c of this.contacts.values()) {
+      touching.add(c.bodyA);
+      touching.add(c.bodyB);
+    }
     for (const [body, [dx, dtheta]] of feedback) {
+      if (touching.has(body)) continue;
       for (const [target, delta] of [
         [body.linearVelocity, dx],
         [body.angularVelocity, dtheta],

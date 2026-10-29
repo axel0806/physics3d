@@ -26,6 +26,16 @@ manager), `src/collision/narrowphase` (support mapping, GJK, EPA, analytic paths
 
 ## Design decisions and tradeoffs
 
+**Joints.** `src/constraints` holds ball, hinge, slider, fixed, distance/spring and cone-twist joints.
+Each is a set of scalar `Row`s plus 3x3 block locks (`PointLock`, `AngularLock`). Joints are solved
+before contacts in every velocity iteration, with warm starting. Positions are corrected in the
+position loop (NGS) along the start-of-step Jacobian. A velocity solver plus end-of-step projection
+loses energy at first order in dt (about 6%/s in circular motion), so the lock correction is fed back
+into the velocities once per step (SHAKE/RATTLE style), capped at `World.maxCorrectionSpeed`. Limit
+corrections are not fed back (they bounce), and neither are corrections on bodies in contact (they pump
+energy). Jointed bodies rotate after the solve; sleep islands connect only through dynamic bodies.
+Known cost: the joint code allocates; it is made allocation-free in Phase 9.
+
 **Mass properties.** Polyhedron moments are integrated over signed tetrahedra with the origin and
 then shifted to the centroid; moments are taken about a vertex, not the origin, so far-offset hulls
 do not lose precision. The plan names Mirtich's projection method; the tetrahedral form is the same
