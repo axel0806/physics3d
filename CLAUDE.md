@@ -44,3 +44,11 @@ Cross-cutting pieces that span several files:
 - Never loosen a test tolerance to make it pass without a justification in `PROGRESS.md` grounded in the numerical method's error bounds; find the root cause instead.
 - Performance regressions are caught by `pnpm bench:check` against `bench/results/baseline.json`.
 - Math tests require 100% line coverage of `src/math` (`pnpm test:coverage`).
+
+## Things that are easy to get wrong
+
+- `pnpm check` runs prettier on the whole tree; on Windows with `core.autocrlf` it flags CRLF files you did not edit (`PLAN.md`, `tsconfig.json`). Run `npx prettier --write` only on files you changed.
+- Timing benchmarks are noisy (up to 25% drift between sessions). Compare old and new code alternately in the same session, and only run one benchmark at a time.
+- Sleeping is decided per body from its touching neighbours with hysteresis plus a small pose window (`updateSleep` in `world.ts`); box-box contacts use a 2 mm speculative margin and position correction has its own 5 mm `contactSlop`. Changing any of these interacts with `tests/physics/pile-sleep.test.ts` (400 boxes, seeds in `tests/helpers/pile.ts`), the tower and pyramid tests.
+- The box-box narrowphase (`sat.ts`, `boxCache.ts`) is scalar and uses module-level scratch buffers: results must stay bit-exact between runs, and `restore()` relies on contacts being rebuilt on the next step.
+- The demo needs WebGL2; with hardware acceleration off it shows a message instead of the scene.

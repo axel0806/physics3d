@@ -44,7 +44,7 @@ verified: "60 fps in Chrome" (software rendering only).
     (20 angles); 20-box tower (<1 cm, sleeps); 55-box pyramid (stable, sleeps).
   - **Not yet done:** the `docs/VALIDATION.md` write-up for these tests; and the phase-5 reviewer subagent pass.
 
-## Phase 6 (joints): done, reviewer pass pending
+## Phase 6 (joints): done
 
 - Implemented in `src/constraints/`: ball, hinge (limits, motor), slider (limits, motor), fixed,
   distance/spring, cone-twist. Rows are scalar (`Row`) or 3x3 blocks (`PointLock`, `AngularLock`).
@@ -70,7 +70,7 @@ verified: "60 fps in Chrome" (software rendering only).
 - Sleeping islands now link through dynamic bodies only (a shared static body no longer merges islands).
 - Not yet done: allocation-free joint code (Phase 9), Phase 6 reviewer pass, `docs/VALIDATION.md`.
 
-## Phase 7 (CCD): done, reviewer pass pending
+## Phase 7 (CCD): done
 
 - `src/collision/toi.ts` (conservative advancement) and `World.ccdMode` ('sweep' default, 'speculative').
   Per-body flag `ccd`. Comparison written up in `docs/ARCHITECTURE.md`.
@@ -280,14 +280,20 @@ verified: "60 fps in Chrome" (software rendering only).
 
 See `docs/ARCHITECTURE.md` (pipeline, solver, position correction, gyroscopic integration, tradeoffs).
 
-## Next steps (in order, superseded by Phase 11 below)
+## Handoff: what is next
 
-1. Record the 100k narrowphase accuracy result in this file (`pnpm bench:accuracy`).
-2. Write `docs/VALIDATION.md` for the Phase 4 and Phase 5 tests (setup, expected, measured).
-3. Phase 5 reviewer subagent (per plan), then fix findings.
-4. Phase 6 reviewer subagent, then fix findings.
-5. Phase 7 reviewer subagent, then Phases 8–11 as planned in `PLAN.md`.
+State: everything in `PLAN.md` is implemented and verified except the 8 ms pile criterion (17.4 ms
+now; see Current status). Suggested order for whoever continues:
 
-## Uncommitted state
+1. **Reach 8 ms for the 1,000-box pile.** Biggest lever is how soon the pile sleeps: replace the
+   NGS position correction with split impulses (pseudo-velocity) or a soft contact so pushes add no
+   kinetic energy, then re-check the 20-box tower (<1 cm), 55-box pyramid, bounce and friction
+   tests. Next: manifold reuse for resting pairs (needs `restore()` to rebuild them), then a
+   cheaper `makeConstraint` and SAT clipping. SIMD/Wasm or workers are last resorts.
+2. **Verify 60 fps in Chrome** on real hardware (only software rendering has been tested).
+3. **Stretch goals** in `PLAN.md` (XPBD, workers, WebGPU, vehicle, cloth) are untouched.
 
-Phase 6 is committed. Full suite (ragdoll excluded): 130 tests pass; 500-drop ragdoll passes.
+Re-verify with `pnpm verify` (check + tests + quick bench) and, before changing performance code,
+`pnpm bench:check` on an otherwise idle machine: wall-clock drift on a laptop is up to 25%
+between sessions, so re-record the baseline (`tsx bench/run.ts --baseline`) in the same session
+as the check. Known open items are in "Known limitations" above.

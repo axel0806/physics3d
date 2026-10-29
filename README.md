@@ -51,3 +51,10 @@ Screenshots are in `docs/screens`.
 
 `test`, `test:physics`, `test:ragdoll` (500 drops), `test:e2e` (headless Chromium smoke test over every
 scene), `bench`, `bench:quick`, `bench:check`, `bench:alloc`, `check` (tsc, eslint, prettier), `verify`.
+
+## Status
+
+All phases in [PLAN.md](PLAN.md) are implemented and verified except one criterion: the 1,000-box pile
+steps in 17 ms median, not the planned 8 ms. See [PROGRESS.md](PROGRESS.md) for numbers, known
+limitations and the suggested next steps. On Windows run `test:ragdoll` and `bench:accuracy` from Git Bash
+(they use POSIX env syntax). The demo needs a browser with WebGL2 and hardware acceleration enabled.
