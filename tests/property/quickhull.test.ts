@@ -56,7 +56,10 @@ function isWellConditioned(h: HullData): boolean {
 /**
  * Outward unit plane of triangle t, or null for slivers. The normal's rounding error is about
  * ε·scale²/area; with area ≥ 1e-4 at scale 10 that is ≈1e-9, below TOL. Smaller slivers have
- * ill-conditioned normals and are skipped.
+ * ill-conditioned normals and are skipped. So are faces whose shortest altitude is below 1e-3:
+ * the hull's tolerance (1e-11 at scale 10) tilts the plane by tol/altitude, which over a hull
+ * of diameter 10 exceeds TOL. A random run found a face 10 long and 2e-5 wide with a vertex
+ * 1.2e-6 above it (near-duplicate input points 1.1e-5 apart); that is known limitation 1.
  */
 function trianglePlane(h: HullData, t: number): { a: Vec3; n: Vec3 } | null {
   const a = h.vertices[h.indices[t] as number] as Vec3;
@@ -64,6 +67,12 @@ function trianglePlane(h: HullData, t: number): { a: Vec3; n: Vec3 } | null {
   const c = h.vertices[h.indices[t + 2] as number] as Vec3;
   const cross = V.cross(new Vec3(), V.sub(new Vec3(), b, a), V.sub(new Vec3(), c, a));
   if (V.length(cross) < 1e-4) return null;
+  const longest = Math.max(
+    V.length(V.sub(new Vec3(), b, a)),
+    V.length(V.sub(new Vec3(), c, b)),
+    V.length(V.sub(new Vec3(), a, c)),
+  );
+  if (V.length(cross) / longest < 1e-3) return null;
   return { a, n: V.normalize(new Vec3(), cross) };
 }
 

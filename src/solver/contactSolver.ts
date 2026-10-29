@@ -14,6 +14,8 @@ export interface SolverPoint {
   /** World offsets from each center of mass, refreshed by prepareContact. */
   readonly rA: Vec3;
   readonly rB: Vec3;
+  /** Separation of a speculative contact (0 for a touching or penetrating one). */
+  gap: number;
   /** Target normal relative velocity (restitution), set by prepareContact. */
   restitutionTarget: number;
   normalMass: number;
@@ -75,7 +77,7 @@ export function effectiveMass(a: RigidBody, b: RigidBody, rA: Vec3, rB: Vec3, d:
  * masses along normal and tangents, and the restitution target. `preRelativeNormalSpeed` is the
  * normal speed measured at the contact point; restitution is applied only above `threshold`.
  */
-export function prepareContact(c: ContactConstraint, threshold: number): void {
+export function prepareContact(c: ContactConstraint, threshold: number, dt = 0): void {
   const a = c.bodyA;
   const b = c.bodyB;
   c.points.forEach((p) => {
@@ -95,6 +97,8 @@ export function prepareContact(c: ContactConstraint, threshold: number): void {
     const vn0 = startNormalSpeedAt(c, p);
     // Restitution: bounce back with speed e·|vn0| only for approaches faster than the threshold.
     p.restitutionTarget = vn0 < -threshold ? -c.restitution * vn0 : 0;
+    // A speculative contact (shapes still apart) lets the bodies approach by the gap, no further.
+    if (p.gap > 0 && dt > 0) p.restitutionTarget = -p.gap / dt;
   });
 }
 

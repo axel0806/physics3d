@@ -26,6 +26,23 @@ manager), `src/collision/narrowphase` (support mapping, GJK, EPA, analytic paths
 
 ## Design decisions and tradeoffs
 
+**Continuous collision detection.** Bodies with `ccd: true` use one of two modes (`World.ccdMode`).
+*Sweep* (default, `src/collision/toi.ts`): conservative advancement on GJK distance finds the first
+time of impact of the body's translation against each collider in the swept bounds. Because the
+separation of two translating convex shapes is convex in time, stepping by (gap / closing speed)
+never overshoots. At the impact the body is placed at the target separation (`linearSlop`), an
+impulse removes the approach speed (with restitution above the threshold), and the rest of the step
+continues with the new velocity, up to four events. Bodies only sweep when they travel more than a
+quarter of their thinnest collider extent per step, so slow bodies take the ordinary path
+unchanged. Limits: other bodies count as stationary during the sweep, rotation is not swept, no
+friction impulse at the impact. *Speculative*: while shapes are still apart but the closing speed
+would cover the gap this step, a one-point contact with a negative depth lets the solver cancel the
+approach beyond the gap. It needs no time-of-impact search and works with the whole solver
+(friction, stacking), but it builds the contact from the closest feature at the start of the step.
+For fast oblique motion that feature can be the wrong one (a wall's edge instead of its face), and
+a contact made at the moment of impact has no restitution. Measured on 500 m/s shots at a 1 cm
+wall: discrete 46% tunnel, speculative 5.5%, sweep 0% (10,000 shots).
+
 **Joints.** `src/constraints` holds ball, hinge, slider, fixed, distance/spring and cone-twist joints.
 Each is a set of scalar `Row`s plus 3x3 block locks (`PointLock`, `AngularLock`). Joints are solved
 before contacts in every velocity iteration, with warm starting. Positions are corrected in the

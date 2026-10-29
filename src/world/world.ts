@@ -14,8 +14,13 @@ import type { ConvexShape } from '../shapes/shape';
 import { BroadPhase, pairKey } from '../collision/broadphase';
 import { Joint } from '../constraints/joint';
 import { manifoldOf } from '../collision/pairs';
+import { gjk } from '../collision/narrowphase';
+import type { ContactManifold } from '../collision/narrowphase/contact';
+import { timeOfImpact, type TimeOfImpact } from '../collision/toi';
 import {
+  applyImpulse,
   buildNormalK,
+  effectiveMass,
   prepareContact,
   solvePosition,
   solveVelocity,
@@ -36,6 +41,11 @@ export interface WorldOptions {
   readonly linearSlop?: number;
   /** Seconds a body must stay below the sleep speeds before it sleeps. */
   readonly sleepTime?: number;
+  /**
+   * How bodies flagged `ccd` avoid tunnelling: 'sweep' finds the time of impact of their motion,
+   * 'speculative' adds contacts for shapes that will touch within the step.
+   */
+  readonly ccdMode?: 'sweep' | 'speculative';
 }
 
 export interface ColliderOptions {
@@ -70,6 +80,7 @@ export class World {
   baumgarte: number;
   linearSlop: number;
   sleepTimeLimit: number;
+  ccdMode: 'sweep' | 'speculative';
   /** Largest velocity (m/s or rad/s) that one joint position correction may feed back. */
   maxCorrectionSpeed = 1;
   /** Frames stepped so far. */
@@ -89,6 +100,7 @@ export class World {
     this.baumgarte = options.baumgarte ?? 0.2;
     this.linearSlop = options.linearSlop ?? 0.0002;
     this.sleepTimeLimit = options.sleepTime ?? 0.5;
+    this.ccdMode = options.ccdMode ?? 'sweep';
   }
 
   createBody(options: BodyOptions = {}): RigidBody {
@@ -152,7 +164,7 @@ export class World {
     if (!(dt > 0)) throw new RangeError('dt must be positive');
     for (const body of this.bodies) body.snapshotVelocities();
     this.updateBroadphase(dt);
-    this.updateContacts();
+    this.updateContacts(dt);
     for (const j of this.joints) {
       if (j.bodyA.awake !== j.bodyB.awake && j.bodyA.isDynamic && j.bodyB.isDynamic) {
         j.bodyA.wake();
@@ -171,7 +183,7 @@ export class World {
     }
     for (const c of this.contacts.values()) {
       if (!this.constraintActive(c)) continue;
-      prepareContact(c, this.restitutionThreshold);
+      prepareContact(c, this.restitutionThreshold, dt);
       buildNormalK(c);
       warmStart(c);
     }
@@ -183,7 +195,13 @@ export class World {
     // free bodies were rotated before it (see integrateOrientation).
     for (const body of this.bodies)
       if (body.jointCount > 0) integrateOrientationPostSolve(body, dt);
-    for (const body of this.bodies) integratePosition(body, dt);
+    // CCD bodies move last, against the final poses of everything else.
+    for (const body of this.bodies) if (!body.ccd) integratePosition(body, dt);
+    for (const body of this.bodies) {
+      if (!body.ccd) continue;
+      if (this.ccdMode === 'sweep' && this.needsSweep(body, dt)) this.sweepBody(body, dt);
+      else integratePosition(body, dt);
+    }
     const feedback = new Map<RigidBody, [Vec3, Vec3]>();
     for (let it = 0; it < this.positionIterations; it++) {
       for (const c of this.contacts.values()) {
@@ -196,6 +214,89 @@ export class World {
     for (const body of this.bodies) body.updateWorldInertia();
     this.updateSleep(dt);
     this.frame++;
+  }
+
+  /** True when the body would move far enough this step (relative to its thinnest collider) to skip over thin geometry. */
+  private needsSweep(body: RigidBody, dt: number): boolean {
+    if (!body.isSimulated) return false;
+    const travel = V.length(body.linearVelocity) * dt;
+    let core = Infinity;
+    const box = new AABB();
+    for (const c of body.colliders) {
+      c.shape.localBounds(box);
+      core = Math.min(core, box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z);
+    }
+    return travel > 0.25 * core;
+  }
+
+  /**
+   * Moves a CCD body through one step, stopping at each impact found by conservative advancement:
+   * at the time of impact the approach velocity is removed (with restitution), and the rest of the
+   * step continues with the new velocity, up to a few events. Other bodies count as stationary and
+   * rotation during the sweep is ignored (the contact solver handles rotation).
+   */
+  private sweepBody(body: RigidBody, dt: number): void {
+    let remaining = 1;
+    for (let event = 0; event < 4 && remaining > 1e-6; event++) {
+      const d = V.scale(new Vec3(), body.linearVelocity, dt * remaining);
+      let best: { toi: TimeOfImpact; ca: Collider; cb: Collider } | null = null;
+      const swept = new AABB();
+      BB.empty(swept);
+      for (const ca of body.colliders) {
+        const start = this.worldBounds(ca);
+        const end = new AABB();
+        BB.set(
+          end,
+          start.min.x + d.x,
+          start.min.y + d.y,
+          start.min.z + d.z,
+          start.max.x + d.x,
+          start.max.y + d.y,
+          start.max.z + d.z,
+        );
+        BB.union(swept, start, end);
+        const ta = body.colliderTransform(ca, new Transform());
+        for (const proxy of this.broadphase.query(swept)) {
+          const cb = this.proxyCollider.get(proxy);
+          if (!cb || !this.shouldCollide(ca, cb)) continue;
+          const tb = cb.body.colliderTransform(cb, new Transform());
+          const toi = timeOfImpact(
+            { shape: ca.shape, transform: ta },
+            { shape: cb.shape, transform: tb },
+            d,
+            new Vec3(),
+            { target: this.linearSlop, tolerance: 0.25 * this.linearSlop },
+          );
+          if (toi && (!best || toi.t < best.toi.t)) best = { toi, ca, cb };
+        }
+      }
+      if (!best) {
+        V.add(body.position, body.position, d);
+        return;
+      }
+      V.addScaled(body.position, body.position, d, best.toi.t);
+      this.resolveImpact(best.ca, best.cb, best.toi);
+      remaining *= 1 - best.toi.t;
+    }
+  }
+
+  /** Impulse at a time of impact: removes the approach speed along the normal, with restitution. */
+  private resolveImpact(ca: Collider, cb: Collider, toi: TimeOfImpact): void {
+    const a = ca.body;
+    const b = cb.body;
+    const rA = V.sub(new Vec3(), toi.pointA, a.position);
+    const rB = V.sub(new Vec3(), toi.pointB, b.position);
+    const vn = V.dot(
+      V.sub(new Vec3(), b.velocityAt(rB, new Vec3()), a.velocityAt(rA, new Vec3())),
+      toi.normal,
+    );
+    if (vn >= 0) return;
+    const e = -vn > this.restitutionThreshold ? Math.max(ca.restitution, cb.restitution) : 0;
+    const j = (-(1 + e) * vn) / effectiveMass(a, b, rA, rB, toi.normal);
+    const P = V.scale(new Vec3(), toi.normal, j);
+    applyImpulse(a, V.negate(new Vec3(), P), rA);
+    applyImpulse(b, P, rB);
+    b.wake();
   }
 
   /**
@@ -283,12 +384,17 @@ export class World {
       if (proxy === undefined) continue;
       const box = this.worldBounds(c);
       const v = c.body.linearVelocity;
+      if (c.body.ccd && this.ccdMode === 'speculative' && c.body.isSimulated) {
+        // Speculative contacts need pairs for everything within this step's reach.
+        BB.expandPoint(box, V.add(new Vec3(), box.min, new Vec3(v.x * dt, v.y * dt, v.z * dt)));
+        BB.expandPoint(box, V.add(new Vec3(), box.max, new Vec3(v.x * dt, v.y * dt, v.z * dt)));
+      }
       this.broadphase.moveProxy(proxy, box, v.x * dt, v.y * dt, v.z * dt);
     }
   }
 
   /** Re-runs the pair manifolds for overlapping collider pairs, keeping impulses by feature id. */
-  private updateContacts(): void {
+  private updateContacts(dt: number): void {
     const changes = this.broadphase.updatePairs();
     for (const ch of changes) {
       if (ch.kind !== 'end') continue;
@@ -308,7 +414,7 @@ export class World {
         this.contacts.delete(key);
         continue;
       }
-      this.refreshPair(key, ca, cb);
+      this.refreshPair(key, ca, cb, dt);
     }
   }
 
@@ -324,10 +430,14 @@ export class World {
     return true;
   }
 
-  private refreshPair(key: number, ca: Collider, cb: Collider): void {
+  private refreshPair(key: number, ca: Collider, cb: Collider, dt: number): void {
     const ta = ca.body.colliderTransform(ca, new Transform());
     const tb = cb.body.colliderTransform(cb, new Transform());
-    const m = manifoldOf({ shape: ca.shape, transform: ta }, { shape: cb.shape, transform: tb });
+    const placedA = { shape: ca.shape, transform: ta };
+    const placedB = { shape: cb.shape, transform: tb };
+    const m =
+      manifoldOf(placedA, placedB) ??
+      (this.ccdMode === 'speculative' ? this.speculative(ca, cb, placedA, placedB, dt) : null);
     const old = this.contacts.get(key);
     if (!m) {
       if (old) {
@@ -345,6 +455,7 @@ export class World {
         localB: localAnchor(cb.body, p.pointB),
         rA: new Vec3(),
         rB: new Vec3(),
+        gap: Math.max(0, -p.depth),
         restitutionTarget: 0,
         normalMass: 0,
         tangentMass1: 0,
@@ -374,6 +485,40 @@ export class World {
       ca.body.wake();
       cb.body.wake();
     }
+  }
+
+  /**
+   * Speculative contact for a CCD body: when the shapes are apart but will close the gap within
+   * this step at their current speeds, a one-point manifold with negative depth lets the solver
+   * stop the approach exactly at touching.
+   */
+  private speculative(
+    ca: Collider,
+    cb: Collider,
+    A: { shape: ConvexShape; transform: Transform },
+    B: { shape: ConvexShape; transform: Transform },
+    dt: number,
+  ): ContactManifold | null {
+    if (!(ca.body.ccd || cb.body.ccd)) return null;
+    const reach = (V.length(ca.body.linearVelocity) + V.length(cb.body.linearVelocity)) * dt;
+    const g = gjk(A, B);
+    if (g.overlap || !(g.distance <= reach)) return null;
+    const normal = V.sub(new Vec3(), g.pointB, g.pointA);
+    V.scale(normal, normal, 1 / g.distance);
+    const closing = V.dot(
+      V.sub(
+        new Vec3(),
+        ca.body.velocityAt(V.sub(new Vec3(), g.pointA, ca.body.position), new Vec3()),
+        cb.body.velocityAt(V.sub(new Vec3(), g.pointB, cb.body.position), new Vec3()),
+      ),
+      normal,
+    );
+    if (closing * dt < g.distance - this.linearSlop) return null;
+    const position = V.lerp(new Vec3(), g.pointA, g.pointB, 0.5);
+    return {
+      normal,
+      points: [{ position, depth: -g.distance, id: -1, pointA: g.pointA, pointB: g.pointB }],
+    };
   }
 
   private emit(e: ContactEvent): void {

@@ -33,6 +33,8 @@ export interface BodyOptions {
   readonly linearDamping?: number;
   readonly angularDamping?: number;
   readonly gravityScale?: number;
+  /** Sweep this body's motion against other colliders so fast movement cannot tunnel. */
+  readonly ccd?: boolean;
 }
 
 /**
@@ -48,6 +50,8 @@ export class RigidBody {
   linearDamping: number;
   angularDamping: number;
   gravityScale: number;
+  /** Continuous collision detection: sweep fast motion for the earliest impact. */
+  ccd: boolean;
   /** Mass and inertia, summed from colliders. Zero for non-dynamic bodies. */
   mass = 0;
   invMass = 0;
@@ -78,6 +82,7 @@ export class RigidBody {
     this.linearDamping = options.linearDamping ?? 0;
     this.angularDamping = options.angularDamping ?? 0;
     this.gravityScale = options.gravityScale ?? 1;
+    this.ccd = options.ccd ?? false;
   }
 
   get isDynamic(): boolean {
