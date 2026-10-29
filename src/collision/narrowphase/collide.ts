@@ -31,7 +31,14 @@ const RESTART_DIRECTIONS = [
 export function collideConvex(A: Placed, B: Placed): ConvexContact {
   const first = gjk(A, B);
   if (!first.overlap) return separated(first);
-  const starts: (Vec3 | undefined)[] = [undefined, ...RESTART_DIRECTIONS];
+  // A 1- or 2-point terminal simplex means the origin sits on a line through the shapes' centers.
+  // EPA started from the flat tetrahedron built around it can fail to converge (measured on
+  // sphere-sphere: 256 splits of a degenerate polytope, ~500 ms, then a 0.3 ms restart succeeds),
+  // so the restart directions are tried first and the original start is kept as the last resort.
+  const starts: (Vec3 | undefined)[] =
+    first.simplex.length < 3
+      ? [...RESTART_DIRECTIONS, undefined]
+      : [undefined, ...RESTART_DIRECTIONS];
   let fallback: EpaResult | null = null;
   let fallbackGjk: GjkResult = first;
   for (const start of starts) {

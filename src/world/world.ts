@@ -182,13 +182,19 @@ export class World {
   }
 
   createBody(options: BodyOptions = {}): RigidBody {
+    if (this.nextBodyId >= 0x4000000) throw new RangeError('too many bodies created');
     const body = new RigidBody(this.nextBodyId++, options);
     this.bodies.push(body);
     return body;
   }
 
-  /** Attaches a convex shape to a body. Call refreshMass after adding colliders. */
+  /** Attaches a shape to a body (mass properties are refreshed automatically). */
   createCollider(body: RigidBody, shape: ColliderShape, options: ColliderOptions = {}): Collider {
+    if (!this.bodies.includes(body)) throw new RangeError('body does not belong to this world');
+    for (const v of [options.friction, options.restitution]) {
+      if (v !== undefined && !(v >= 0))
+        throw new RangeError('friction and restitution must be >= 0');
+    }
     if (shape instanceof TriangleMesh && body.type !== 'static') {
       throw new RangeError('a triangle mesh collider needs a static body');
     }
@@ -202,16 +208,25 @@ export class World {
       mask: options.mask ?? 0xffffffff,
     };
     body.colliders.push(c);
+    try {
+      body.refreshMassProperties();
+    } catch (e) {
+      body.colliders.pop();
+      body.refreshMassProperties();
+      throw e;
+    }
     this.colliders.push(c);
     const proxy = this.broadphase.createProxy(this.worldBounds(c));
     this.colliderProxy.set(c, proxy);
     this.proxyCollider.set(proxy, c);
-    body.refreshMassProperties();
     return c;
   }
 
   /** Registers a joint. Unless `collideConnected`, its two bodies stop colliding with each other. */
   addJoint<J extends Joint>(joint: J): J {
+    if (joint.bodyA === joint.bodyB) throw new RangeError('a joint needs two different bodies');
+    if (!this.bodies.includes(joint.bodyA) || !this.bodies.includes(joint.bodyB))
+      throw new RangeError('joint bodies must belong to this world');
     this.joints.push(joint);
     joint.bodyA.jointCount++;
     joint.bodyB.jointCount++;
@@ -283,6 +298,10 @@ export class World {
         this.emit({ kind: 'end', a: first ? c : other, b: first ? other : c });
       }
     }
+    // Bodies resting on this one (their contacts were dropped while asleep) must wake.
+    for (const other of this.broadphase.query(this.worldBounds(c))) {
+      this.proxyCollider.get(other)?.body.wake();
+    }
     this.broadphase.destroyProxy(proxy);
     this.broadphase.updatePairs();
     this.colliderProxy.delete(c);
@@ -290,6 +309,7 @@ export class World {
     this.colliders.splice(this.colliders.indexOf(c), 1);
     c.body.colliders.splice(c.body.colliders.indexOf(c), 1);
     if (c.body.isDynamic && c.body.colliders.length > 0) c.body.refreshMassProperties();
+    else if (c.body.isDynamic) c.body.makeMassless();
   }
 
   /** Removes a body with its colliders and joints; bodies that touched it or were jointed to it wake. */
@@ -316,6 +336,8 @@ export class World {
    * factor alpha in [0, 1) for rendering between the previous and current pose.
    */
   advance(frameTime: number): number {
+    if (!Number.isFinite(frameTime)) throw new RangeError('frameTime must be finite');
+    if (!(this.fixedDt > 0)) throw new RangeError('fixedDt must be positive');
     this.accumulator += Math.max(0, frameTime);
     let steps = 0;
     while (this.accumulator >= this.fixedDt && steps < this.maxSubSteps) {
@@ -579,7 +601,7 @@ export class World {
 
   /** Advances the simulation by dt seconds. */
   step(dt: number): void {
-    if (!(dt > 0)) throw new RangeError('dt must be positive');
+    if (!(dt > 0) || !Number.isFinite(dt)) throw new RangeError('dt must be positive and finite');
     if (this.clock) {
       const t = this.timings;
       t.broadphase = t.narrowphase = t.solve = t.integrate = 0;
@@ -640,6 +662,7 @@ export class World {
     // free bodies were rotated before it (see integrateOrientation).
     for (const body of this.bodies)
       if (body.jointCount > 0) integrateOrientationPostSolve(body, dt);
+    for (const body of this.bodies) if (body.type === 'kinematic') this.moveKinematic(body, dt);
     // CCD bodies move last, against the final poses of everything else.
     for (const body of this.bodies) if (!body.ccd) integratePosition(body, dt);
     for (const body of this.bodies) {
@@ -664,6 +687,18 @@ export class World {
     this.updateSleep(dt);
     this.lap('integrate');
     this.frame++;
+  }
+
+  /** Kinematic bodies follow their velocities exactly; nothing pushes them. */
+  private moveKinematic(body: RigidBody, dt: number): void {
+    V.addScaled(body.position, body.position, body.linearVelocity, dt);
+    const w = body.angularVelocity;
+    const len = V.length(w);
+    if (len > 0) {
+      const dq = Q.fromAxisAngle(new Quat(), V.scale(new Vec3(), w, 1 / len), len * dt);
+      Q.mul(body.orientation, dq, body.orientation);
+      Q.normalize(body.orientation, body.orientation);
+    }
   }
 
   /** True when the body would move far enough this step (relative to its thinnest collider) to skip over thin geometry. */
@@ -735,6 +770,9 @@ export class World {
   private resolveImpact(ca: Collider, cb: Collider, toi: TimeOfImpact): void {
     const a = ca.body;
     const b = cb.body;
+    // Wake first: impulses are ignored on sleeping bodies.
+    a.wake();
+    b.wake();
     const rA = V.sub(new Vec3(), toi.pointA, a.position);
     const rB = V.sub(new Vec3(), toi.pointB, b.position);
     const vn = V.dot(
@@ -850,23 +888,42 @@ export class World {
       const ca = this.proxyCollider.get(ch.a);
       const cb = this.proxyCollider.get(ch.b);
       if (!ca || !cb) continue;
-      this.dropPair(pairKey(ch.a, ch.b));
-      this.emit({ kind: 'end', a: ca, b: cb });
+      const key = pairKey(ch.a, ch.b);
+      const had = this.contacts.has(key) || this.meshContacts.has(key);
+      this.dropPair(key);
+      if (had) this.emit({ kind: 'end', a: ca, b: cb });
     }
-    // Refresh manifolds for every overlapping pair (cheap for tests; a real engine would cache).
+    // Refresh manifolds for every overlapping pair.
+    const wakesBefore = this.pairWakes;
     for (const [key, pair] of this.currentPairs()) {
       const [ia, ib] = pair;
       const ca = this.proxyCollider.get(ia);
       const cb = this.proxyCollider.get(ib);
       if (!ca || !cb) continue;
       if (!this.shouldCollide(ca, cb)) {
-        this.dropPair(key);
+        this.skippedPairs.push(key, ia, ib);
         continue;
       }
       this.refreshPair(key, ca, cb, dt);
     }
+    // A pair of sleepers is judged again once the pass above has woken whatever it touches, so a
+    // body woken by a later pair does not miss its contacts for a step.
+    const skipped = this.skippedPairs;
+    const recheck = this.pairWakes !== wakesBefore;
+    for (let i = 0; i < skipped.length; i += 3) {
+      const key = skipped[i] as number;
+      const ca = recheck ? this.proxyCollider.get(skipped[i + 1] as number) : undefined;
+      const cb = recheck ? this.proxyCollider.get(skipped[i + 2] as number) : undefined;
+      if (ca && cb && this.shouldCollide(ca, cb)) this.refreshPair(key, ca, cb, dt);
+      else this.dropPair(key);
+    }
+    skipped.length = 0;
     this.lap('narrowphase');
   }
+
+  /** Scratch for `updateContacts`: (pair key, proxy a, proxy b) triples that were not collided yet. */
+  private readonly skippedPairs: number[] = [];
+  private pairWakes = 0;
 
   private currentPairs(): [number, [number, number]][] {
     return this.broadphase.pairList().map(([a, b]) => [pairKey(a, b), [a, b]]);
@@ -875,14 +932,17 @@ export class World {
   private shouldCollide(a: Collider, b: Collider): boolean {
     if (a.body === b.body) return false;
     if (this.jointedPairs.has(bodyPairKey(a.body, b.body))) return false;
-    if (!(a.body.isSimulated || b.body.isSimulated)) return false;
+    if (!(a.body.isSimulated || b.body.isSimulated)) {
+      // A moving kinematic body must still reach (and wake) a sleeping dynamic one.
+      if (!(movesOnto(a.body, b.body) || movesOnto(b.body, a.body))) return false;
+    }
     if ((a.mask & b.layer) === 0 || (b.mask & a.layer) === 0) return false;
     return true;
   }
 
   private dropPair(key: number): void {
-    this.contacts.delete(key);
-    this.meshContacts.delete(key);
+    if (this.contacts.size > 0) this.contacts.delete(key);
+    if (this.meshContacts.size > 0) this.meshContacts.delete(key);
   }
 
   /** Contacts between a static triangle mesh and a convex collider: one constraint per triangle. */
@@ -934,10 +994,7 @@ export class World {
       const old = subs?.get(tri + 1);
       const c = this.makeConstraint(ca, cb, m, old, tri + 1);
       next.set(tri + 1, c);
-      if (!old && (ca.body.awake || cb.body.awake)) {
-        ca.body.wake();
-        cb.body.wake();
-      }
+      if (!old && (ca.body.awake || cb.body.awake)) this.wakePair(ca.body, cb.body);
     }
     const had = subs !== undefined && subs.size > 0;
     if (next.size > 0) this.meshContacts.set(key, next);
@@ -969,13 +1026,20 @@ export class World {
     const c = this.makeConstraint(ca, cb, m, old, 0);
     if (!old) this.emit({ kind: 'begin', a: ca, b: cb });
     else this.emit({ kind: 'persist', a: ca, b: cb });
+    // A listener may have destroyed either collider; do not resurrect a contact for it.
+    if (!this.colliderProxy.has(ca) || !this.colliderProxy.has(cb)) return;
     this.contacts.set(key, c);
     // A new contact wakes an island that touches an awake body. Persisting contacts do not wake
     // anything, so resting stacks can accumulate sleep time.
-    if (!old && (ca.body.awake || cb.body.awake)) {
-      ca.body.wake();
-      cb.body.wake();
-    }
+    if (!old && (ca.body.awake || cb.body.awake)) this.wakePair(ca.body, cb.body);
+  }
+
+  /** Wakes both bodies of a new contact, counting sleepers that woke (see `updateContacts`). */
+  private wakePair(a: RigidBody, b: RigidBody): void {
+    if (a.isDynamic && !a.awake) this.pairWakes++;
+    if (b.isDynamic && !b.awake) this.pairWakes++;
+    a.wake();
+    b.wake();
   }
 
   /** Builds a solver constraint from a manifold, carrying impulses over from `old` by feature id. */
@@ -1055,7 +1119,8 @@ export class World {
   }
 
   private emit(e: ContactEvent): void {
-    for (const l of this.listeners) l(e);
+    // Iterate a copy: a listener may remove itself or others.
+    for (const l of [...this.listeners]) l(e);
   }
 
   /** Puts islands of slow bodies to sleep, using union-find over active contacts. */
@@ -1130,8 +1195,16 @@ function placedBounds(shape: ColliderShape, t: Transform): AABB {
   return out;
 }
 
+function movesOnto(x: RigidBody, y: RigidBody): boolean {
+  return (
+    x.type === 'kinematic' &&
+    y.isDynamic &&
+    (V.lengthSq(x.linearVelocity) > 0 || V.lengthSq(x.angularVelocity) > 0)
+  );
+}
+
 function bodyPairKey(a: RigidBody, b: RigidBody): number {
-  return a.id < b.id ? a.id * 1048576 + b.id : b.id * 1048576 + a.id;
+  return a.id < b.id ? a.id * 0x4000000 + b.id : b.id * 0x4000000 + a.id;
 }
 
 /** Anchor of a world point in a body's frame: the inverse rotation of (point − center of mass). */

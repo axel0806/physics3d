@@ -8,6 +8,23 @@ const BETA = () => Joint.beta;
 /** Largest angular limit violation (rad) corrected in one NGS iteration. */
 const MAX_LIMIT_FIX = 0.2;
 
+function checkPoint(v: Vec3, what: string): void {
+  if (!Number.isFinite(v.x) || !Number.isFinite(v.y) || !Number.isFinite(v.z)) {
+    throw new RangeError(`${what} must be finite`);
+  }
+}
+
+function checkAxis(v: Vec3, what: string): void {
+  checkPoint(v, what);
+  if (!(V.length(v) > 0)) throw new RangeError(`${what} must have non-zero length`);
+}
+
+function checkLimits(lower: number, upper: number, what: string): void {
+  if (Number.isNaN(lower) || Number.isNaN(upper) || lower > upper) {
+    throw new RangeError(`${what}: lower (${lower}) must not exceed upper (${upper})`);
+  }
+}
+
 /** Ball-and-socket: the two anchor points coincide. Three translational DOF locked. */
 export class BallJoint extends Joint {
   readonly localA: Vec3;
@@ -16,6 +33,7 @@ export class BallJoint extends Joint {
 
   constructor(a: RigidBody, b: RigidBody, worldAnchor: Vec3) {
     super(a, b);
+    checkPoint(worldAnchor, 'BallJoint anchor');
     this.localA = localPoint(a, worldAnchor);
     this.localB = localPoint(b, worldAnchor);
   }
@@ -42,6 +60,7 @@ export class FixedJoint extends Joint {
 
   constructor(a: RigidBody, b: RigidBody, worldAnchor: Vec3) {
     super(a, b);
+    checkPoint(worldAnchor, 'FixedJoint anchor');
     this.localA = localPoint(a, worldAnchor);
     this.localB = localPoint(b, worldAnchor);
     this.angular = new AngularLock(a, b);
@@ -115,6 +134,8 @@ export class HingeJoint extends Joint {
     options: HingeOptions = {},
   ) {
     super(a, b);
+    checkPoint(worldAnchor, 'HingeJoint anchor');
+    checkAxis(worldAxis, 'HingeJoint axis');
     const axis = V.normalize(new Vec3(), worldAxis);
     this.localA = localPoint(a, worldAnchor);
     this.localB = localPoint(b, worldAnchor);
@@ -126,6 +147,7 @@ export class HingeJoint extends Joint {
     this.enableLimit = options.lower !== undefined || options.upper !== undefined;
     this.lower = options.lower ?? -Math.PI;
     this.upper = options.upper ?? Math.PI;
+    if (this.enableLimit) checkLimits(this.lower, this.upper, 'HingeJoint limits');
     this.enableMotor = options.motorSpeed !== undefined;
     this.motorSpeed = options.motorSpeed ?? 0;
     this.maxMotorTorque = options.maxMotorTorque ?? 0;
@@ -292,6 +314,8 @@ export class SliderJoint extends Joint {
     options: SliderOptions = {},
   ) {
     super(a, b);
+    checkPoint(worldAnchor, 'SliderJoint anchor');
+    checkAxis(worldAxis, 'SliderJoint axis');
     this.localA = localPoint(a, worldAnchor);
     this.localB = localPoint(b, worldAnchor);
     this.axisA = localDir(a, V.normalize(new Vec3(), worldAxis));
@@ -299,6 +323,7 @@ export class SliderJoint extends Joint {
     this.enableLimit = options.lower !== undefined || options.upper !== undefined;
     this.lower = options.lower ?? -Infinity;
     this.upper = options.upper ?? Infinity;
+    if (this.enableLimit) checkLimits(this.lower, this.upper, 'SliderJoint limits');
     this.enableMotor = options.motorSpeed !== undefined;
     this.motorSpeed = options.motorSpeed ?? 0;
     this.maxMotorForce = options.maxMotorForce ?? 0;
@@ -445,6 +470,11 @@ export class DistanceJoint extends Joint {
     options: DistanceOptions = {},
   ) {
     super(a, b);
+    checkPoint(worldAnchorA, 'DistanceJoint anchor A');
+    checkPoint(worldAnchorB, 'DistanceJoint anchor B');
+    if (options.length !== undefined && !(Number.isFinite(options.length) && options.length >= 0)) {
+      throw new RangeError('DistanceJoint length must be finite and non-negative');
+    }
     this.localA = localPoint(a, worldAnchorA);
     this.localB = localPoint(b, worldAnchorB);
     this.length = options.length ?? V.distance(worldAnchorA, worldAnchorB);
@@ -539,6 +569,11 @@ export class ConeTwistJoint extends Joint {
     options: ConeTwistOptions,
   ) {
     super(a, b);
+    checkPoint(worldAnchor, 'ConeTwistJoint anchor');
+    checkAxis(worldTwistAxis, 'ConeTwistJoint axis');
+    if (!(options.swingSpan >= 0) || !(options.twistSpan >= 0)) {
+      throw new RangeError('ConeTwistJoint swingSpan and twistSpan must be non-negative');
+    }
     this.localA = localPoint(a, worldAnchor);
     this.localB = localPoint(b, worldAnchor);
     const x = V.normalize(new Vec3(), worldTwistAxis);

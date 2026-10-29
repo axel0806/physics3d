@@ -222,31 +222,36 @@ export class ContactBatch {
     const mu = this.cFriction[k] as number;
     for (let q = start; q < end; q++) {
       const maxF = mu * (this.pImpulse[3 * q] as number);
-      this.solveTangent(k, a, b, q, 1, maxF);
-      this.solveTangent(k, a, b, q, 2, maxF);
+      // Both tangent velocities are cancelled together, then the 2D impulse is bounded by the
+      // Coulomb cone (norm <= mu N), so friction is isotropic.
+      const t1 = this.cTan1;
+      const t2 = this.cTan2;
+      const t1x = t1[3 * k] as number;
+      const t1y = t1[3 * k + 1] as number;
+      const t1z = t1[3 * k + 2] as number;
+      const t2x = t2[3 * k] as number;
+      const t2y = t2[3 * k + 1] as number;
+      const t2z = t2[3 * k + 2] as number;
+      const m1 = this.pMass[3 * q + 1] as number;
+      const m2 = this.pMass[3 * q + 2] as number;
+      const acc1 = this.pImpulse[3 * q + 1] as number;
+      const acc2 = this.pImpulse[3 * q + 2] as number;
+      let n1 = acc1 - this.speedAlong(a, b, q, t1x, t1y, t1z) * m1;
+      let n2 = acc2 - this.speedAlong(a, b, q, t2x, t2y, t2z) * m2;
+      const lenSq = n1 * n1 + n2 * n2;
+      if (lenSq > maxF * maxF) {
+        const s = maxF / Math.sqrt(lenSq);
+        n1 *= s;
+        n2 *= s;
+      }
+      const d1 = n1 - acc1;
+      const d2 = n2 - acc2;
+      if (m1 > 0) this.track(Math.abs(d1) / m1);
+      if (m2 > 0) this.track(Math.abs(d2) / m2);
+      this.pImpulse[3 * q + 1] = n1;
+      this.pImpulse[3 * q + 2] = n2;
+      this.applyPair(a, b, q, t1x * d1 + t2x * d2, t1y * d1 + t2y * d2, t1z * d1 + t2z * d2);
     }
-  }
-
-  private solveTangent(
-    k: number,
-    a: number,
-    b: number,
-    q: number,
-    which: 1 | 2,
-    maxF: number,
-  ): void {
-    const t = which === 1 ? this.cTan1 : this.cTan2;
-    const tx = t[3 * k] as number;
-    const ty = t[3 * k + 1] as number;
-    const tz = t[3 * k + 2] as number;
-    const mass = this.pMass[3 * q + which] as number;
-    const acc = this.pImpulse[3 * q + which] as number;
-    const vt = this.speedAlong(a, b, q, tx, ty, tz);
-    const next = Math.max(-maxF, Math.min(maxF, acc - vt * mass));
-    const d = next - acc;
-    if (mass > 0) this.track(Math.abs(d) / mass);
-    this.pImpulse[3 * q + which] = next;
-    this.applyPair(a, b, q, tx * d, ty * d, tz * d);
   }
 
   private track(dv: number): void {

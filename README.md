@@ -3,7 +3,7 @@
 A from-scratch 3D rigid-body physics engine in TypeScript with no runtime dependencies, plus a raw
 WebGL2 renderer and demo.
 
-- Shapes: sphere, box, capsule, convex hull, static triangle mesh (BVH), compounds.
+- Shapes: sphere, box, capsule, convex hull, static triangle mesh (BVH). A body with several colliders acts as a compound.
 - Collision: dynamic AABB tree broadphase, GJK/EPA with analytic fast paths, box–box SAT manifolds.
 - Dynamics: sequential impulses with warm starting, block normal solve, friction cones, NGS position
   correction, sleeping islands, gyroscopic integration.

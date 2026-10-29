@@ -53,7 +53,7 @@ contacts exist only for shapes that really overlap, and those are a function of 
 ## Design decisions and tradeoffs
 
 **Continuous collision detection.** Bodies with `ccd: true` use one of two modes (`World.ccdMode`).
-*Sweep* (default, `src/collision/toi.ts`): conservative advancement on GJK distance finds the first
+_Sweep_ (default, `src/collision/toi.ts`): conservative advancement on GJK distance finds the first
 time of impact of the body's translation against each collider in the swept bounds. Because the
 separation of two translating convex shapes is convex in time, stepping by (gap / closing speed)
 never overshoots. At the impact the body is placed at the target separation (`linearSlop`), an
@@ -61,7 +61,7 @@ impulse removes the approach speed (with restitution above the threshold), and t
 continues with the new velocity, up to four events. Bodies only sweep when they travel more than a
 quarter of their thinnest collider extent per step, so slow bodies take the ordinary path
 unchanged. Limits: other bodies count as stationary during the sweep, rotation is not swept, no
-friction impulse at the impact. *Speculative*: while shapes are still apart but the closing speed
+friction impulse at the impact. _Speculative_: while shapes are still apart but the closing speed
 would cover the gap this step, a one-point contact with a negative depth lets the solver cancel the
 approach beyond the gap. It needs no time-of-impact search and works with the whole solver
 (friction, stacking), but it builds the contact from the closest feature at the start of the step.
@@ -77,7 +77,7 @@ loses energy at first order in dt (about 6%/s in circular motion), so the lock c
 into the velocities once per step (SHAKE/RATTLE style), capped at `World.maxCorrectionSpeed`. Limit
 corrections are not fed back (they bounce), and neither are corrections on bodies in contact (they pump
 energy). Jointed bodies rotate after the solve; sleep islands connect only through dynamic bodies.
-Known cost: the joint code allocates; it is made allocation-free in Phase 9.
+Known cost: the joint code, the narrowphase and per-step contact construction still allocate short-lived objects; only the contact solver iterations are allocation-free (the batch solver for joint-free worlds, scalar loops otherwise).
 
 **Mass properties.** Polyhedron moments are integrated over signed tetrahedra with the origin and
 then shifted to the centroid; moments are taken about a vertex, not the origin, so far-offset hulls
@@ -143,4 +143,16 @@ they are a candidate for the CCD work in Phase 7.
 below 1e-2 m/s and 1e-2 rad/s for 0.5 s. A new contact wakes its bodies; a persisting one does not
 (waking on every step kept resting stacks awake).
 
-**Friction and CCD.** No continuous collision yet; fast bodies can tunnel. That is Phase 7.
+**Friction.** Friction is a joint 2D solve over both tangent directions with a clamp on the norm of
+the tangent impulse (a round cone, mu times the normal load). The earlier per-axis clamp gave a square
+pyramid: the speed of a body on a 33 degree slope varied 0.35-2.52 m/s with azimuth; the round cone
+gives 2.52-2.64 m/s. CCD is described above.
+
+**Waking and sleeping pairs.** A CCD impact on a sleeping body wakes both bodies before the impulse.
+If anything wakes during the contact pass, sleeping pairs are re-checked afterwards so that a body woken
+by a later contact does not miss its contacts for a step (that miss let the bottom box of a sleeping
+stack sink 5.7 mm).
+
+**Spin drift.** The orientation advances by a finite rotation per step, so world-frame angular momentum
+of a torque-free spinning body drifts at second order in dt (1 s at 60 rad/s: 6.1e-3 at 240 Hz, 1.6e-3
+at 480 Hz, 4.1e-4 at 960 Hz). The 60-iteration gyroscopic fixed point is converged.

@@ -84,7 +84,7 @@ export function applyImpulseXYZ(
 
 /** Effective inverse mass of the pair along unit direction d at offsets rA and rB. */
 export function effectiveMass(a: RigidBody, b: RigidBody, rA: Vec3, rB: Vec3, d: Vec3): number {
-  let k = a.invMass + b.invMass;
+  let k = (a.isSimulated ? a.invMass : 0) + (b.isSimulated ? b.invMass : 0);
   if (a.isSimulated) {
     const c = V.cross(new Vec3(), rA, d);
     k += V.dot(c, M3.mulVec(new Vec3(), a.worldInvInertia, c));
@@ -209,12 +209,6 @@ function impulseVector(c: ContactConstraint, n: number, t1: number, t2: number):
 }
 
 /**
- * Largest change in relative speed (m/s) caused by any impulse update since the last reset. The
- * world resets it before each velocity iteration and stops iterating once it is negligible.
- */
-export const solverStats = { maxChange: 0 };
-
-/**
  * One sequential-impulse pass. All normal impulses are solved first (each clamped to ≥ 0), then
  * friction is solved against the updated normal loads, so no point's friction is sized from an
  * unsettled normal load. Solving per point in one interleaved loop lets friction at one corner
@@ -230,14 +224,30 @@ export function solveVelocity(c: ContactConstraint): void {
       const next = Math.max(0, p.impulseN + (p.restitutionTarget - vn) * p.normalMass);
       const dn = next - p.impulseN;
       p.impulseN = next;
-      if (p.normalMass > 0) trackChange(Math.abs(dn) / p.normalMass);
       applyPair(c, p, n.x * dn, n.y * dn, n.z * dn);
     }
   }
   for (const p of c.points) {
     const maxF = c.friction * p.impulseN;
-    solveTangent(c, p, c.tangent1, maxF, 1);
-    solveTangent(c, p, c.tangent2, maxF, 2);
+    // Both tangent velocities are cancelled together, then the 2D impulse is bounded by the
+    // Coulomb cone (norm <= mu N), so friction is isotropic.
+    const t1 = c.tangent1;
+    const t2 = c.tangent2;
+    const v1 = relativeSpeed(c, p, t1.x, t1.y, t1.z);
+    const v2 = relativeSpeed(c, p, t2.x, t2.y, t2.z);
+    let n1 = p.impulseT1 - v1 * p.tangentMass1;
+    let n2 = p.impulseT2 - v2 * p.tangentMass2;
+    const lenSq = n1 * n1 + n2 * n2;
+    if (lenSq > maxF * maxF) {
+      const k = maxF / Math.sqrt(lenSq);
+      n1 *= k;
+      n2 *= k;
+    }
+    const d1 = n1 - p.impulseT1;
+    const d2 = n2 - p.impulseT2;
+    p.impulseT1 = n1;
+    p.impulseT2 = n2;
+    applyPair(c, p, t1.x * d1 + t2.x * d2, t1.y * d1 + t2.y * d2, t1.z * d1 + t2.z * d2);
   }
 }
 
@@ -303,7 +313,6 @@ function solveNormalBlock(c: ContactConstraint): boolean {
       const lam = BLK_LAM[i] as number;
       const d = lam - p.impulseN;
       p.impulseN = lam;
-      if (p.normalMass > 0) trackChange(Math.abs(d) / p.normalMass);
       applyPair(c, p, nrm.x * d, nrm.y * d, nrm.z * d);
     }
     return true;
@@ -346,29 +355,6 @@ function eliminate(m: number): boolean {
     BLK_M[r * w + m] = s / (BLK_M[r * w + r] as number);
   }
   return true;
-}
-
-/** Solves one friction direction at a point, clamped to the Coulomb bound. `which` picks the stored accumulator. */
-function solveTangent(
-  c: ContactConstraint,
-  p: SolverPoint,
-  t: Vec3,
-  maxF: number,
-  which: 1 | 2,
-): void {
-  const mass = which === 1 ? p.tangentMass1 : p.tangentMass2;
-  const acc = which === 1 ? p.impulseT1 : p.impulseT2;
-  const vt = relativeSpeed(c, p, t.x, t.y, t.z);
-  const next = Math.max(-maxF, Math.min(maxF, acc - vt * mass));
-  const d = next - acc;
-  if (mass > 0) trackChange(Math.abs(d) / mass);
-  if (which === 1) p.impulseT1 = next;
-  else p.impulseT2 = next;
-  applyPair(c, p, t.x * d, t.y * d, t.z * d);
-}
-
-function trackChange(dv: number): void {
-  if (dv > solverStats.maxChange) solverStats.maxChange = dv;
 }
 
 /** Applies +P to body B and −P to body A at the point's offsets. */

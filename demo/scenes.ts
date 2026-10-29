@@ -95,7 +95,14 @@ function throwSphere(world: World, origin: Vec3, direction: Vec3, speed = 25): R
   return b;
 }
 
-const clickToThrow = (world: World) => (o: Vec3, d: Vec3) => void throwSphere(world, o, d);
+/** Click handler that throws a ball; only the most recent 40 balls are kept. */
+const clickToThrow = (world: World) => {
+  const thrown: RigidBody[] = [];
+  return (o: Vec3, d: Vec3) => {
+    thrown.push(throwSphere(world, o, d));
+    if (thrown.length > 40) world.destroyBody(thrown.shift() as RigidBody);
+  };
+};
 
 export const scenes: SceneSpec[] = [
   // ---- validation scenes -------------------------------------------------------------------

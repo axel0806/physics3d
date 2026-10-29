@@ -2,9 +2,10 @@
 
 ## Current status
 
-**Not complete.** Phases 0–3 are done; Phase 4 is nearly done; Phase 5 has all acceptance scenarios
-passing but no `docs/VALIDATION.md` write-up yet. Phases 6 (joints) and 7 (CCD) are implemented and tested (reviewer passes pending); Phases 8–11 are not started. The last full run
-of `pnpm test` (default sample sizes) passed 119 tests across 12 files, and `pnpm check` passed.
+**Phases 0-10 are implemented and tested; Phase 11 (final audit) is in progress. Not yet COMPLETE:**
+the plan's 8 ms median for the 1,000-box pile is **not met** (see Phase 9), and dense random piles
+do not go to sleep (limitation 8). Everything else in the plan has an automated check. Last full run
+(ragdoll excluded): all tests pass; the 500-drop ragdoll and the 19-scene browser smoke test pass.
 
 ## Phase status
 
@@ -85,6 +86,36 @@ of `pnpm test` (default sample sizes) passed 119 tests across 12 files, and `pnp
 - Event semantics: a contact between a sleeping body and a static body is dropped silently when the
   island sleeps (no `end` event), and recreated with `begin` on wake.
 
+## Phase 9 (performance): done except the 8 ms target
+
+- Changes: allocation-free contact solver, a struct-of-arrays batch solver for joint-free worlds
+  (`src/solver/batch.ts`, early exit once impulses converge), scalar inertia/sleep/position code,
+  BVH-backed static triangle meshes with a face-normal fast path (`triangleContact.ts`), a faster GJK
+  simplex step, 4 instead of 10 position passes over contacts, per-phase timing (`world.clock`).
+- Runner: `pnpm bench` (median, p99, max and per-phase medians per scene, JSON in `bench/results`),
+  `--baseline` records, `pnpm bench:check` fails if a median is more than 10% slower than the
+  baseline. `pnpm bench:alloc` (`--expose-gc`) checks retained heap growth over 1,000 steps: no
+  growth in any scene (the narrowphase still creates short-lived garbage that the collector reclaims).
+- **8 ms target not met.** The 1,000-box pile (ten layers, 2,000-2,500 contacts, all awake) went from
+  191 ms to about 85 ms median. The remaining cost is the 40-iteration block solve itself (about
+  1 us per constraint per iteration in JS); getting to 8 ms needs far fewer iterations, a different
+  solver (soft constraints or TGS substeps) or most of the pile asleep. Numbers: see the table below.
+- Phase 11 profile of the 1,000-box pile (`BENCH_ITERS`, `--quick`, this machine): 40 iterations 106 ms (bp 3.4, np 24, solve 70, int 9); 10 iterations 70 ms (solve 26); 4 iterations 62 ms (solve 19, np 29). Cutting iterations alone cannot reach 8 ms: even at 4 the narrowphase (about 10 us per pair) and integrate phases alone are about 38 ms. A real fix needs all of: a cheaper box-box path, far fewer iterations (TGS or soft constraints), and sleeping. Not attempted yet.
+- Mesh pipeline: 100 bodies on a 100k-triangle terrain went from 554 ms to about 60 ms.
+
+## Phase 10 (renderer and demo): done
+
+- `demo/`: raw WebGL2 (instanced boxes, spheres, capsules, hulls, meshes; directional light with a
+  PCF shadow map; orbit and fly cameras; debug draw of contacts, normals, AABBs, broadphase tree,
+  joints, islands by sleep state), UI panel (scene picker, play/pause/step/reset, step rate and
+  iteration sliders, time scale, perf graph, body inspector) and 19 scenes: the validation scenes
+  plus Jenga, dominoes, wrecking ball, vehicle, ragdoll cannon and click-to-throw.
+- Checks: `tests/demo/scenes.test.ts` (every scene in Node) and `pnpm test:e2e` (Playwright, headless
+  Chromium with software WebGL2: every scene, 300 frames, no console errors, finite positions, draws
+  something). 19 of 19 pass; screenshots in `docs/screens`.
+- Not verified: the "60 fps in Chrome" criterion (software rendering only; the step time of the large
+  scenes is above 16 ms, see Phase 9).
+
 ## Known limitations (carry-forward)
 
 1. **Near-flat hulls (thickness ratio ≲ 1e-4)**: quickhull can accept a near-duplicate vertex in a
@@ -101,6 +132,26 @@ of `pnpm test` (default sample sizes) passed 119 tests across 12 files, and `pnp
    55-box pyramid (stable at 40, not at 20). Phase 9 must budget for this.
 6. **Hull support** is O(V) per call and hull construction is O(n·F). Fine for now; revisit in Phase 9.
 7. **Friction**: stacking stability depends on friction (frictionless stacks topple), which is physical.
+8. **Dense piles do not sleep**: 400 random boxes in a 9 x 9 m arena keep about 1 J of kinetic energy
+   for 25 s. With position correction off they sleep within 10 s, so the NGS push-out feeds energy
+   back through gravity. Fewer contact position passes (4) helped but did not cure it. Unresolved.
+9. **Mesh contacts** use the triangle face normal; edge-on cases fall back to GJK/EPA.
+10. Static bodies moved after creation are not re-inserted in the broadphase (proxies of static and
+    sleeping bodies are skipped each step); teleport them with a kinematic body or recreate them.
+
+11. **Torque-free spin drift is second order in dt (not a bug)**: world-frame L of a freely spinning
+    body drifts because the orientation update is a finite rotation per step. Measured 1 s drift at
+    60 rad/s: 6.1e-3 at 240 Hz, 1.6e-3 at 480 Hz, 4.1e-4 at 960 Hz (factor 4 per doubling). At 120 Hz
+    a step turns the body 0.5 rad, drift 2%. The test tolerance is justified by this scaling. The
+    60-iteration gyroscopic fixed point is converged: 600 iterations give an identical error.
+12. **Open reviewer suspicions (unconfirmed, no failing test yet)**: the tangent basis in
+    `perpendicular()` flips at |nx| = 0.577, so a warm-started friction impulse may be applied in a
+    rotated frame for one step; `timeOfImpact` returns null after 64 non-converged iterations (the
+    sweep then misses the hit); the sweep impact applies no friction and does not sweep rotation;
+    `restore()` emits no contact end events; orientation lags the solve by one step; the sleep
+    threshold compares squared speed.
+13. **Open API items**: `step()` allocates short-lived garbage (`orderedContacts`, `currentPairs`, a
+    per-step `Map`, `refreshPair`); `onContact` has no unsubscribe return value.
 
 ## Bugs found and fixed during this work (for the record)
 
@@ -122,6 +173,15 @@ of `pnpm test` (default sample sizes) passed 119 tests across 12 files, and `pnp
   Now: block normal LCP (active-set), then friction.
 - Position correction: rotational pushes toppled tall stacks; now linear only. Slop 0.2 mm (4 mm sag over 20 boxes).
 - Waking on every persisting contact reset the sleep timer; now only new contacts wake.
+- Phase 11 review round (two independent reviewers: physical correctness, API and code quality):
+  - Friction was a square (pyramid) cone and anisotropic: speed down a 33 degree slope varied
+    0.35-2.52 m/s with azimuth. Now a joint 2D solve with a norm clamp (2.52-2.64 m/s).
+  - A CCD impact on a sleeping body lost momentum; both bodies are now woken first.
+  - A body woken by a later contact missed its contacts for one step, and the bottom box of a
+    sleeping stack sank 5.7 mm. Sleeping pairs are now re-checked after the pass if anything woke.
+  - Input validation: `createBody` rejects non-finite or negative damping, `addJoint` rejects the same
+    body twice or foreign bodies, `createCollider` rolls back if mass setup throws.
+  - Tests: `tests/physics/review-correctness.test.ts`, `tests/unit/validation.test.ts`.
 - Friction test placed boxes inside the ramp, and the Dzhanibekov test mis-detected flips in world frame.
   Both are test bugs, fixed.
 
@@ -129,7 +189,7 @@ of `pnpm test` (default sample sizes) passed 119 tests across 12 files, and `pnp
 
 See `docs/ARCHITECTURE.md` (pipeline, solver, position correction, gyroscopic integration, tradeoffs).
 
-## Next steps (in order)
+## Next steps (in order, superseded by Phase 11 below)
 
 1. Record the 100k narrowphase accuracy result in this file (`pnpm bench:accuracy`).
 2. Write `docs/VALIDATION.md` for the Phase 4 and Phase 5 tests (setup, expected, measured).

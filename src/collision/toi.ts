@@ -51,6 +51,10 @@ export function timeOfImpact(
       const n = V.normalize(new Vec3(), rel);
       return { t, normal: n, pointA: r.pointA, pointB: r.pointB };
     }
+    if (!(r.distance > 0))
+      return t === 0
+        ? null
+        : { t, normal: V.normalize(new Vec3(), rel), pointA: r.pointA, pointB: r.pointB };
     const gap = r.distance - options.target;
     const n = V.sub(new Vec3(), r.pointB, r.pointA);
     V.scale(n, n, 1 / r.distance);

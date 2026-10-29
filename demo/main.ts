@@ -2,7 +2,7 @@ import { Vec3 } from '../src/math';
 import type { RigidBody } from '../src/dynamics/body';
 import { Camera } from './camera';
 import { defaultDebug, Renderer, type DebugFlags } from './renderer';
-import { scenes, type SceneInstance, type SceneSpec } from './scenes';
+import { scenes, type SceneSpec } from './scenes';
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 const params = new URLSearchParams(location.search);
@@ -14,7 +14,7 @@ const camera = new Camera();
 const debug: DebugFlags = defaultDebug();
 
 let spec: SceneSpec = scenes.find((s) => s.id === params.get('scene')) ?? (scenes[0] as SceneSpec);
-let inst: SceneInstance = spec.build();
+let inst = spec.build();
 let playing = true;
 let stepOnce = false;
 let simTime = 0;
@@ -256,11 +256,12 @@ function frame(now: number): void {
     const stepsDone = w.frame - before;
     if (stepsDone > 0) {
       simTime += stepsDone * w.fixedDt;
-      inst.update?.(simTime, w.fixedDt);
+      for (let i = 0; i < stepsDone; i++) inst.update?.(simTime, w.fixedDt);
       stepMs.push((performance.now() - t0) / stepsDone);
       if (stepMs.length > 120) stepMs.shift();
     }
   }
+  if (selected && !w.bodies.includes(selected)) selected = null;
   renderer.render(w, playing ? alpha : 1, camera, debug, selected);
   frames++;
   statsClock += dt;

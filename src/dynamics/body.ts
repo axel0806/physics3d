@@ -86,6 +86,19 @@ export class RigidBody {
   readonly id: number;
 
   constructor(id: number, options: BodyOptions = {}) {
+    for (const v of [options.position, options.linearVelocity, options.angularVelocity]) {
+      if (v && !(Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z)))
+        throw new RangeError('body position and velocities must be finite');
+    }
+    const q = options.orientation;
+    if (
+      q &&
+      !(Number.isFinite(q.x + q.y + q.z + q.w) && q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w > 0)
+    )
+      throw new RangeError('body orientation must be finite and non-zero');
+    for (const d of [options.linearDamping, options.angularDamping]) {
+      if (d !== undefined && !(d >= 0)) throw new RangeError('damping must be >= 0');
+    }
     this.id = id;
     this.type = options.type ?? 'dynamic';
     this.position = options.position?.clone() ?? new Vec3();
@@ -109,6 +122,15 @@ export class RigidBody {
     return this.type === 'dynamic' && this.awake;
   }
 
+  /** A dynamic body with no colliders has no mass: it neither falls nor responds to impulses. */
+  makeMassless(): void {
+    this.mass = 0;
+    this.invMass = 0;
+    this.localInvInertia.e.fill(0);
+    this.localInertia.e.fill(0);
+    this.worldInvInertia.e.fill(0);
+  }
+
   /** Recomputes mass, center of mass, and inverse inertia from the colliders. Dynamic bodies only. */
   refreshMassProperties(): void {
     if (!this.isDynamic) {
@@ -129,6 +151,15 @@ export class RigidBody {
     }
     const total = parts.length ? combine(parts) : emptyMassProperties();
     if (!(total.mass > 0)) throw new RangeError('dynamic body needs positive mass');
+    // `position` is the centre of mass. If the colliders put it elsewhere, move the origin there:
+    // shift the body by R * com and every collider frame by -com, so nothing moves in the world.
+    const com = total.centerOfMass;
+    if (V.lengthSq(com) > 1e-24) {
+      const shift = Q.rotate(new Vec3(), this.orientation, com);
+      V.add(this.position, this.position, shift);
+      V.copy(this.prevPosition, this.position);
+      for (const c of this.colliders) V.sub(c.local.p, c.local.p, com);
+    }
     this.mass = total.mass;
     this.invMass = 1 / total.mass;
     const inv = new Mat3();
