@@ -230,6 +230,13 @@ by about 10%; the baseline was recorded on a quiet machine).
     (test: `gyroscopic integration at large dt*|w|`). 2 to 6 mm margins now agree (max speed 28 m/s).
     Sleep timers also use hysteresis now (hold between 1x and 2x the sleep speeds, reset above 2x), which
     took the bench pile from 351 to 90 awake bodies at 6 s.
+    Rest window (seed 7 and seed 2 of the pile helper kept 3 to 9 bodies awake at 20 s): a body wedged by
+    single-point contacts jitters 1 cm at 0.05 to 0.2 m/s because 4 position passes lift it, the 2 mm
+    speculative margin then lets it fall back by gap/dt, and gravity repeats the cycle (it persists with
+    40 velocity iterations; with position correction off or margin 0 it sleeps). The sleep timer now also
+    runs while a body stays within 1 cm and 0.05 rad of the pose where its timer started, whatever its
+    speed; leaving the window without being slow resets the timer. Free fall leaves the window within
+    45 ms. Pile seeds 1 to 8 all sleep within 4 to 12 s.
     Position correction still injects some energy in the first seconds; a split-impulse or soft contact
     solver would be the real fix.
 

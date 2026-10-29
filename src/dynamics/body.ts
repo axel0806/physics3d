@@ -92,6 +92,9 @@ export class RigidBody {
   /** Sleep bookkeeping. */
   awake = true;
   sleepTime = 0;
+  /** Pose at the start of the current rest window (see World.updateSleep). */
+  readonly restPosition: Vec3 = new Vec3();
+  readonly restOrientation: Quat = new Quat(0, 0, 0, 1);
   readonly id: number;
 
   constructor(id: number, options: BodyOptions = {}) {

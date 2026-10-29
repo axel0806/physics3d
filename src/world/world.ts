@@ -97,7 +97,7 @@ export interface WorldSnapshot {
   readonly joints: readonly (readonly number[])[];
 }
 
-const BODY_STRIDE = 22;
+const BODY_STRIDE = 29;
 /**
  * Separation at which a query cast counts as touching. Closest-point directions are only as
  * accurate as eps / separation, so the target is not zero: 1e-7 gives normals good to ~1e-8 and
@@ -577,6 +577,8 @@ export class World {
       bodies.set([
         p.x, p.y, p.z, q.x, q.y, q.z, q.w, v.x, v.y, v.z, w.x, w.y, w.z,
         b.sleepTime, b.awake ? 1 : 0, pp.x, pp.y, pp.z, pq.x, pq.y, pq.z, pq.w,
+        b.restPosition.x, b.restPosition.y, b.restPosition.z,
+        b.restOrientation.x, b.restOrientation.y, b.restOrientation.z, b.restOrientation.w,
       ], i * BODY_STRIDE);
     });
     return {
@@ -617,6 +619,8 @@ export class World {
       b.awake = d[14] === 1;
       V.set(b.prevPosition, d[15] as number, d[16] as number, d[17] as number);
       Q.set(b.prevOrientation, d[18] as number, d[19] as number, d[20] as number, d[21] as number);
+      V.set(b.restPosition, d[22] as number, d[23] as number, d[24] as number);
+      Q.set(b.restOrientation, d[25] as number, d[26] as number, d[27] as number, d[28] as number);
       b.updateWorldInertia();
     });
     this.frame = snap.frame;
@@ -1413,6 +1417,13 @@ export class World {
    * touches a sleeping one wakes it, which keeps sleepers from hanging in the air when their
    * support moves.
    */
+  /** True while the body is within `restWindowDistance` and `restWindowAngle` of its rest-window pose. */
+  private inRestWindow(body: RigidBody): boolean {
+    if (V.distanceSq(body.position, body.restPosition) > REST_WINDOW_DISTANCE ** 2) return false;
+    const w = Math.abs(Q.dot(body.orientation, body.restOrientation));
+    return w >= REST_WINDOW_COS_HALF_ANGLE;
+  }
+
   private updateSleep(contacts: readonly ContactConstraint[], dt: number): void {
     // Union-find over the bodies, with the parent links stored on the bodies themselves.
     const sl2 = this.sleepLinearSpeed ** 2;
@@ -1425,8 +1436,22 @@ export class World {
       // (a settling heap twitches across the threshold every few frames), and resets above.
       const lin = V.lengthSq(body.linearVelocity);
       const ang = V.lengthSq(body.angularVelocity);
+      // A body that stays inside a small pose window is at rest even if the solver keeps it
+      // jittering above the speed thresholds (a wedge of single-point contacts trades position
+      // correction against gravity forever). Free motion cannot hide in the window: gravity alone
+      // carries a body 1 cm in 45 ms.
+      if (body.sleepTime === 0) {
+        V.copy(body.restPosition, body.position);
+        Q.copy(body.restOrientation, body.orientation);
+      }
+      const inWindow = this.inRestWindow(body);
+      if (!inWindow) {
+        V.copy(body.restPosition, body.position);
+        Q.copy(body.restOrientation, body.orientation);
+      }
       if (lin < sl2 && ang < sa2) body.sleepTime += dt;
-      else if (lin >= SLEEP_RESET * sl2 || ang >= SLEEP_RESET * sa2) body.sleepTime = 0;
+      else if (inWindow) body.sleepTime += dt;
+      else body.sleepTime = 0;
       body.islandMin = body.sleepTime;
     }
     // A shared static floor or anchor never couples bodies.
@@ -1485,8 +1510,9 @@ export class World {
   }
 }
 
-/** Squared speed ratio above which a body's rest timer resets (twice the sleep speed). */
-const SLEEP_RESET = 4;
+/** Pose window of a resting body: 1 cm and 0.05 rad (q.q' = cos(angle / 2)). */
+const REST_WINDOW_DISTANCE = 0.01;
+const REST_WINDOW_COS_HALF_ANGLE = Math.cos(0.025);
 
 function findIsland(b: RigidBody): RigidBody {
   let r = b;
