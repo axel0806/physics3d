@@ -297,7 +297,7 @@ export class ContactBatch {
    * Nonlinear Gauss-Seidel position correction along the contact normals, linear only (see
    * `solvePosition` in contactSolver.ts). Reads the bodies' current positions, writes them back.
    */
-  solvePositions(passes: number, baumgarte: number, slop: number): void {
+  solvePositions(passes: number, baumgarte: number, slop: number, maxStep = Infinity): void {
     const pos = this.pos;
     for (let i = 1; i < this.bodyCount; i++) {
       const b = this.bodies[i] as RigidBody;
@@ -336,7 +336,7 @@ export class ContactBatch {
               (pos[3 * a + 2] as number) -
               (this.pSA[o + 2] as number)) *
               nz;
-          const error = Math.min(0, sep + slop);
+          const error = Math.max(-maxStep / baumgarte, Math.min(0, sep + slop));
           if (error === 0) continue;
           const s = (-baumgarte * error) / kn;
           if (imA !== 0) {

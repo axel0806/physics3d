@@ -76,6 +76,7 @@ let sBestNz = 0;
 let sBestKind = 0; // 0 faceA, 1 faceB, 2 edge
 let sBestIndex = 0;
 let sEarlyOut = false;
+let sMargin = 0;
 let sSeparated = false;
 let sA: OrientedBox;
 let sB: OrientedBox;
@@ -103,8 +104,9 @@ function consider(ux: number, uy: number, uz: number, kind: number, index: numbe
   const dn = sDx * nx + sDy * ny + sDz * nz;
   const overlap = radius(sA, nx, ny, nz) + radius(sB, nx, ny, nz) - Math.abs(dn);
   const score = kind === 2 ? overlap + EDGE_BIAS : overlap;
-  // A strictly negative score guarantees the final best axis separates (its overlap <= score < 0).
-  if (sEarlyOut && score < 0) {
+  // A score below -margin guarantees the final best axis separates by more than the margin
+  // (its overlap <= score < -margin).
+  if (sEarlyOut && score < -sMargin) {
     sSeparated = true;
     return;
   }
@@ -126,7 +128,7 @@ function consider(ux: number, uy: number, uz: number, kind: number, index: numbe
 }
 
 /** Runs the 15-axis test into the module state. Returns false when separated (early-out mode). */
-function runSat(a: OrientedBox, b: OrientedBox, earlyOut: boolean): boolean {
+function runSat(a: OrientedBox, b: OrientedBox, earlyOut: boolean, margin = 0): boolean {
   sA = a;
   sB = b;
   sDx = b.center.x - a.center.x;
@@ -135,6 +137,7 @@ function runSat(a: OrientedBox, b: OrientedBox, earlyOut: boolean): boolean {
   sBestScore = Infinity;
   sBestOverlap = 0;
   sEarlyOut = earlyOut;
+  sMargin = margin;
   sSeparated = false;
   for (let i = 0; i < 3; i++) {
     const v = a.axes[i] as Vec3;
@@ -159,7 +162,7 @@ function runSat(a: OrientedBox, b: OrientedBox, earlyOut: boolean): boolean {
 
 /** Separating-axis test over the 15 candidate axes. For boxes the penetration depth is exact. */
 export function satBoxBox(a: OrientedBox, b: OrientedBox): SatResult {
-  runSat(a, b, false);
+  runSat(a, b, false, 0);
   if (sBestScore === Infinity) throw new Error('SAT: no candidate axes');
   return {
     separated: sBestOverlap < 0,
@@ -229,15 +232,15 @@ function clipScalar(nx: number, ny: number, nz: number, d: number, idBase: numbe
  * keep the points that penetrate it. Edge contacts yield one closest-point contact. Feature ids
  * depend only on the geometry, so they persist across frames.
  */
-export function boxBoxManifold(a: OrientedBox, b: OrientedBox): ContactManifold | null {
-  if (!runSat(a, b, true)) return null;
+export function boxBoxManifold(a: OrientedBox, b: OrientedBox, margin = 0): ContactManifold | null {
+  if (!runSat(a, b, true, margin)) return null;
   if (sBestScore === Infinity) throw new Error('SAT: no candidate axes');
-  if (sBestOverlap < 0) return null;
+  if (sBestOverlap < -margin) return null;
   const Nx = sBestNx;
   const Ny = sBestNy;
   const Nz = sBestNz;
   const depthSat = sBestOverlap;
-  if (sBestKind === 2) return edgeContact(a, b, new Vec3(Nx, Ny, Nz), depthSat);
+  if (sBestKind === 2) return edgeContact(a, b, new Vec3(Nx, Ny, Nz), depthSat, margin > 0);
 
   const refIsA = sBestKind === 0;
   const ref = refIsA ? a : b;
@@ -326,8 +329,9 @@ export function boxBoxManifold(a: OrientedBox, b: OrientedBox): ContactManifold 
     const py = poly[i * 4 + 1] as number;
     const pz = poly[i * 4 + 2] as number;
     const depth = planeOffset - (nx * px + ny * py + nz * pz);
-    if (depth < -1e-9) continue;
-    const dd = Math.max(0, depth);
+    if (depth < -Math.max(1e-9, margin)) continue;
+    // Within the margin the depth stays negative: a speculative point that is still apart.
+    const dd = margin > 0 ? depth : Math.max(0, depth);
     const qx = px + nx * dd;
     const qy = py + ny * dd;
     const qz = pz + nz * dd;
@@ -357,7 +361,7 @@ export function boxBoxManifold(a: OrientedBox, b: OrientedBox): ContactManifold 
     cand[o + 10] = poly[i * 4 + 3] as number;
     nc++;
   }
-  if (nc === 0) return edgeContact(a, b, new Vec3(Nx, Ny, Nz), depthSat);
+  if (nc === 0) return edgeContact(a, b, new Vec3(Nx, Ny, Nz), depthSat, margin > 0);
 
   const reduced = nc > 4;
   const nOut = reduced ? reduceCandidates(nc) : nc;
@@ -480,11 +484,17 @@ function argmaxAbsDot(
 }
 
 /** Single contact at the closest points of the two support edges along the SAT edge axis. */
-function edgeContact(a: OrientedBox, b: OrientedBox, N: Vec3, depth: number): ContactManifold {
+function edgeContact(
+  a: OrientedBox,
+  b: OrientedBox,
+  N: Vec3,
+  depth: number,
+  signed = false,
+): ContactManifold {
   const ea = supportEdge(a, N);
   const eb = supportEdge(b, V.negate(new Vec3(), N));
   const [s] = closestSegmentParams(ea[0], ea[1], eb[0], eb[1]);
-  const dd = Math.max(0, depth);
+  const dd = signed ? depth : Math.max(0, depth);
   // A's surface point is the closest point on its edge; B's is pushed back by -N*depth.
   const pointA = V.lerp(new Vec3(), ea[0], ea[1], s);
   const pointB = V.addScaled(new Vec3(), pointA, N, -dd);

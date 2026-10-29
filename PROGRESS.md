@@ -171,6 +171,25 @@ do not go to sleep (limitation 8). Everything else in the plan has an automated 
 13. **Open API items**: `step()` allocates short-lived garbage (`orderedContacts`, `currentPairs`, a
     per-step `Map`, `refreshPair`); `onContact` has no unsubscribe return value.
 
+14. **Dense piles and sleeping (mostly solved, not perfect)**: 400 random boxes in a 9 x 9 m arena
+    (`tests/physics/pile-sleep.test.ts`) used to keep about 1 J of kinetic energy and never sleep (0 of
+    400 asleep after 20 s; with position correction off they slept at about 9 s). Causes: (a) box-box
+    manifolds kept only penetrating corners, so a resting box rocked between one- and two-point
+    contacts; (b) the 0.2 mm position-correction slop is below the compression residual of a loaded
+    heap (measured: about 850 contact points 3 to 14 mm deep in a settled 8-layer pile), so the push-out
+    fired every step and hopped bodies against gravity; (c) a single restless body kept its whole
+    union-find island awake, and every flickering contact woke both bodies. Fixes: 2 mm box-box
+    contact margin (speculative points; `contactMargin`), separate 5 mm `contactSlop` for position
+    correction (`linearSlop` is unchanged for CCD), sleep speeds 0.04 m/s and 0.15 rad/s, per-body
+    neighbour sleep (a body sleeps when it and every body it touches are slow; joints still sleep as a
+    group), and wake-on-contact only for moving or kinematic bodies. Result: the 400-box pile is fully
+    asleep at 11.7 s (test bound 20 s, runs in about 30 s); the bench 1000-box pile is 31 percent asleep
+    at 4 s, 77 percent at 6 s and 96 percent at 20 s, but not monotonic (individual bodies keep waking
+    neighbours, so it does not reach 100 percent). The ragdoll heap explodes with a 4 mm margin (a
+    solver instability under heavy impulses that was not root-caused); 2 mm is the tested value.
+    Position correction still injects some energy in the first seconds; a split-impulse or soft contact
+    solver would be the real fix.
+
 ## Bugs found and fixed during this work (for the record)
 
 - Quickhull: orphan points reassigned to new faces only (lost points); degenerate-simplex test used a
