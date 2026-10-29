@@ -9,7 +9,20 @@ const params = new URLSearchParams(location.search);
 const AUTO = params.get('auto') === '1';
 
 const canvas = $<HTMLCanvasElement>('view');
-const renderer = new Renderer(canvas);
+let renderer: Renderer;
+try {
+  renderer = new Renderer(canvas);
+} catch (e) {
+  const box = document.createElement('div');
+  box.style.cssText =
+    'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;' +
+    'font:16px system-ui,sans-serif;color:#222;text-align:center;z-index:10;';
+  box.textContent =
+    `${(e as Error).message}. This demo needs WebGL2. Turn on hardware acceleration in your ` +
+    'browser settings (Chrome: Settings > System), update your graphics driver, or try another browser.';
+  document.body.append(box);
+  throw e;
+}
 const camera = new Camera();
 const debug: DebugFlags = defaultDebug();
 

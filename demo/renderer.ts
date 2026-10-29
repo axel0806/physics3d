@@ -183,7 +183,11 @@ export class Renderer {
   instances = 0;
 
   constructor(readonly canvas: HTMLCanvasElement) {
-    const gl = canvas.getContext('webgl2', { antialias: true, alpha: false });
+    // Some browsers/GPUs refuse the first request (antialiasing, blocklisted GPU): relax it.
+    const gl =
+      canvas.getContext('webgl2', { antialias: true, alpha: false }) ??
+      canvas.getContext('webgl2', { antialias: false, alpha: false }) ??
+      canvas.getContext('webgl2', { antialias: false, alpha: false, powerPreference: 'low-power' });
     if (!gl) throw new Error('WebGL2 is not available');
     this.gl = gl;
     const l = this.lightDir;
