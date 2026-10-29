@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>physics3d demo</title>
+    <style>
+      :root {
+        --panel: rgba(18, 22, 30, 0.88);
+        --ink: #e8ecf3;
+        --muted: #98a3b5;
+        --accent: #5eb0ff;
+        --line: rgba(255, 255, 255, 0.12);
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #9fb0c6;
+        color: var(--ink);
+        font:
+          13px/1.4 system-ui,
+          sans-serif;
+        overflow: hidden;
+      }
+      canvas#view {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+        touch-action: none;
+      }
+      #panel {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        width: 268px;
+        max-height: calc(100% - 24px);
+        overflow: auto;
+        padding: 12px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        backdrop-filter: blur(6px);
+      }
+      #panel h1 {
+        margin: 0 0 8px;
+        font-size: 14px;
+        letter-spacing: 0.02em;
+      }
+      #panel h2 {
+        margin: 14px 0 6px;
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      select,
+      button {
+        font: inherit;
+        color: var(--ink);
+        background: #263042;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 5px 8px;
+      }
+      select {
+        width: 100%;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:hover {
+        background: #31405a;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        margin: 6px 0;
+        align-items: center;
+      }
+      .row label {
+        flex: 1;
+        color: var(--muted);
+      }
+      .row output {
+        min-width: 44px;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+      input[type='range'] {
+        width: 100%;
+        accent-color: var(--accent);
+      }
+      .checks label {
+        display: inline-block;
+        width: 48%;
+        margin: 2px 0;
+        color: var(--ink);
+      }
+      #desc {
+        color: var(--muted);
+        margin: 6px 0 0;
+      }
+      #stats,
+      #inspector {
+        font-variant-numeric: tabular-nums;
+        color: var(--muted);
+        white-space: pre;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+      #graph {
+        width: 100%;
+        height: 56px;
+        background: rgba(0, 0, 0, 0.3);
+        border-radius: 6px;
+        display: block;
+      }
+      #hint {
+        position: fixed;
+        right: 12px;
+        bottom: 10px;
+        color: #243044;
+        font-size: 12px;
+        text-align: right;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="panel">
+      <h1>physics3d</h1>
+      <select id="scene" aria-label="Scene"></select>
+      <p id="desc"></p>
+      <div class="row">
+        <button id="play">Pause</button>
+        <button id="step">Step</button>
+        <button id="reset">Reset</button>
+      </div>
+      <h2>Simulation</h2>
+      <div class="row"><label for="hz">Step rate</label><output id="hzOut"></output></div>
+      <input id="hz" type="range" min="30" max="480" step="10" />
+      <div class="row">
+        <label for="vit">Velocity iterations</label><output id="vitOut"></output>
+      </div>
+      <input id="vit" type="range" min="1" max="60" step="1" />
+      <div class="row">
+        <label for="pit">Position iterations</label><output id="pitOut"></output>
+      </div>
+      <input id="pit" type="range" min="0" max="20" step="1" />
+      <div class="row"><label for="speed">Time scale</label><output id="speedOut"></output></div>
+      <input id="speed" type="range" min="0.1" max="2" step="0.1" />
+      <h2>Debug draw</h2>
+      <div class="checks" id="checks"></div>
+      <h2>Performance</h2>
+      <canvas id="graph" width="240" height="56"></canvas>
+      <div id="stats"></div>
+      <h2>Inspector</h2>
+      <div id="inspector">click a body</div>
+    </div>
+    <div id="hint">
+      drag: orbit · right-drag / shift-drag: pan · wheel: zoom · F: fly (WASD, Q/E) · click: throw
+      or select (shift)
+    </div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

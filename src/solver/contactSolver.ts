@@ -1,4 +1,4 @@
-import { Vec3 } from '../math';
+import { Vec3, type Quat } from '../math';
 import * as V from '../math/vec3';
 import * as Q from '../math/quat';
 import * as M3 from '../math/mat3';
@@ -104,15 +104,17 @@ export function effectiveMass(a: RigidBody, b: RigidBody, rA: Vec3, rB: Vec3, d:
 export function prepareContact(c: ContactConstraint, threshold: number, dt = 0): void {
   const a = c.bodyA;
   const b = c.bodyB;
-  c.points.forEach((p) => {
+  for (const p of c.points) {
     // Impulses act at the midpoint of the two surface anchors, so both bodies receive their
     // offsets from the same world point. Equal and opposite impulses then exert no net torque
     // about the origin even for tangential friction.
-    const pa = V.add(new Vec3(), a.position, Q.rotate(new Vec3(), a.orientation, p.localA));
-    const pb = V.add(new Vec3(), b.position, Q.rotate(new Vec3(), b.orientation, p.localB));
-    const mid = V.lerp(new Vec3(), pa, pb, 0.5);
-    V.sub(p.rA, mid, a.position);
-    V.sub(p.rB, mid, b.position);
+    const ra = rotated(a.orientation, p.localA);
+    const rb = rotated(b.orientation, p.localB);
+    const midx = 0.5 * (a.position.x + ra.x + b.position.x + rb.x);
+    const midy = 0.5 * (a.position.y + ra.y + b.position.y + rb.y);
+    const midz = 0.5 * (a.position.z + ra.z + b.position.z + rb.z);
+    V.set(p.rA, midx - a.position.x, midy - a.position.y, midz - a.position.z);
+    V.set(p.rB, midx - b.position.x, midy - b.position.y, midz - b.position.z);
     p.normalMass = invOrZero(effectiveMass(a, b, p.rA, p.rB, c.normal));
     p.tangentMass1 = invOrZero(effectiveMass(a, b, p.rA, p.rB, c.tangent1));
     p.tangentMass2 = invOrZero(effectiveMass(a, b, p.rA, p.rB, c.tangent2));
@@ -123,7 +125,17 @@ export function prepareContact(c: ContactConstraint, threshold: number, dt = 0):
     p.restitutionTarget = vn0 < -threshold ? -c.restitution * vn0 : 0;
     // A speculative contact (shapes still apart) lets the bodies approach by the gap, no further.
     if (p.gap > 0 && dt > 0) p.restitutionTarget = -p.gap / dt;
-  });
+  }
+}
+
+const ROT_SCRATCH_A = new Vec3();
+const ROT_SCRATCH_B = new Vec3();
+let rotToggle = false;
+
+/** q * v into one of two reused vectors (so a caller may hold two results at once). */
+function rotated(q: Quat, v: Vec3): Vec3 {
+  rotToggle = !rotToggle;
+  return Q.rotate(rotToggle ? ROT_SCRATCH_A : ROT_SCRATCH_B, q, v);
 }
 
 /** Normal effective-mass matrix over all points of a constraint: K_ij = invMA + invMB + (rA_i×n)·IA(rA_j×n) + (rB_i×n)·IB(rB_j×n). */
@@ -197,6 +209,12 @@ function impulseVector(c: ContactConstraint, n: number, t1: number, t2: number):
 }
 
 /**
+ * Largest change in relative speed (m/s) caused by any impulse update since the last reset. The
+ * world resets it before each velocity iteration and stops iterating once it is negligible.
+ */
+export const solverStats = { maxChange: 0 };
+
+/**
  * One sequential-impulse pass. All normal impulses are solved first (each clamped to ≥ 0), then
  * friction is solved against the updated normal loads, so no point's friction is sized from an
  * unsettled normal load. Solving per point in one interleaved loop lets friction at one corner
@@ -212,6 +230,7 @@ export function solveVelocity(c: ContactConstraint): void {
       const next = Math.max(0, p.impulseN + (p.restitutionTarget - vn) * p.normalMass);
       const dn = next - p.impulseN;
       p.impulseN = next;
+      if (p.normalMass > 0) trackChange(Math.abs(dn) / p.normalMass);
       applyPair(c, p, n.x * dn, n.y * dn, n.z * dn);
     }
   }
@@ -284,6 +303,7 @@ function solveNormalBlock(c: ContactConstraint): boolean {
       const lam = BLK_LAM[i] as number;
       const d = lam - p.impulseN;
       p.impulseN = lam;
+      if (p.normalMass > 0) trackChange(Math.abs(d) / p.normalMass);
       applyPair(c, p, nrm.x * d, nrm.y * d, nrm.z * d);
     }
     return true;
@@ -341,9 +361,14 @@ function solveTangent(
   const vt = relativeSpeed(c, p, t.x, t.y, t.z);
   const next = Math.max(-maxF, Math.min(maxF, acc - vt * mass));
   const d = next - acc;
+  if (mass > 0) trackChange(Math.abs(d) / mass);
   if (which === 1) p.impulseT1 = next;
   else p.impulseT2 = next;
   applyPair(c, p, t.x * d, t.y * d, t.z * d);
+}
+
+function trackChange(dv: number): void {
+  if (dv > solverStats.maxChange) solverStats.maxChange = dv;
 }
 
 /** Applies +P to body B and −P to body A at the point's offsets. */
@@ -419,19 +444,23 @@ export function solvePosition(c: ContactConstraint, baumgarte: number, slop: num
   let worst = 0;
   const a = c.bodyA;
   const b = c.bodyB;
+  const n = c.normal;
   for (const p of c.points) {
-    const pa = V.add(new Vec3(), a.position, Q.rotate(new Vec3(), a.orientation, p.localA));
-    const pb = V.add(new Vec3(), b.position, Q.rotate(new Vec3(), b.orientation, p.localB));
-    const sep = V.dot(V.sub(new Vec3(), pb, pa), c.normal);
+    const ra = rotated(a.orientation, p.localA);
+    const rb = rotated(b.orientation, p.localB);
+    const sep =
+      (b.position.x + rb.x - a.position.x - ra.x) * n.x +
+      (b.position.y + rb.y - a.position.y - ra.y) * n.y +
+      (b.position.z + rb.z - a.position.z - ra.z) * n.z;
     const error = Math.min(0, sep + slop);
     worst = Math.min(worst, error);
     if (error === 0) continue;
     // Linear-only correction, so the effective mass is the translational one.
     const kn = (a.isSimulated ? a.invMass : 0) + (b.isSimulated ? b.invMass : 0);
     if (!(kn > 0)) continue;
-    const P = V.scale(new Vec3(), c.normal, (-baumgarte * error) / kn);
-    applyPositionImpulse(a, V.negate(new Vec3(), P));
-    applyPositionImpulse(b, P);
+    const s = (-baumgarte * error) / kn;
+    applyPositionImpulse(a, -n.x * s, -n.y * s, -n.z * s);
+    applyPositionImpulse(b, n.x * s, n.y * s, n.z * s);
   }
   return worst;
 }
@@ -442,9 +471,9 @@ export function solvePosition(c: ContactConstraint, baumgarte: number, slop: num
  * topple (measured: a 20-box tower collapsed within seconds). The velocity solve still carries the
  * rotational effects, so only the positional fix-up is translational.
  */
-function applyPositionImpulse(body: RigidBody, P: Vec3): void {
+function applyPositionImpulse(body: RigidBody, px: number, py: number, pz: number): void {
   if (!body.isSimulated) return;
-  body.position.x += P.x * body.invMass;
-  body.position.y += P.y * body.invMass;
-  body.position.z += P.z * body.invMass;
+  body.position.x += px * body.invMass;
+  body.position.y += py * body.invMass;
+  body.position.z += pz * body.invMass;
 }

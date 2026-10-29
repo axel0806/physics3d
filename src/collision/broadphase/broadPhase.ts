@@ -85,6 +85,11 @@ export class BroadPhase {
     return this.pairs.has(pairKey(a, b));
   }
 
+  /** Visits every node of the underlying tree (for debug drawing). */
+  forEachNode(visit: (box: AABB, depth: number, isLeaf: boolean) => void): void {
+    this.tree.forEachNode(visit);
+  }
+
   /** Proxies whose fat box overlaps `box`. */
   query(box: AABB): number[] {
     return this.tree.query(box);

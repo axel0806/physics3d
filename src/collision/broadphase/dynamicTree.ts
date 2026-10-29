@@ -49,6 +49,23 @@ export class DynamicTree {
     return this.root === NULL ? -1 : (this.height[this.root] as number);
   }
 
+  /** Visits every node (internal and leaf) with its stored box and depth, root first. */
+  forEachNode(visit: (box: AABB, depth: number, isLeaf: boolean) => void): void {
+    if (this.root === NULL) return;
+    const box = new AABB();
+    const stack: [number, number][] = [[this.root, 0]];
+    while (stack.length > 0) {
+      const [node, depth] = stack.pop() as [number, number];
+      visit(readBox(this.fat, node, box), depth, this.leaf[node] === 1);
+      if (this.leaf[node] !== 1) {
+        stack.push(
+          [this.child2[node] as number, depth + 1],
+          [this.child1[node] as number, depth + 1],
+        );
+      }
+    }
+  }
+
   /** Tight AABB of a proxy (copy into `out`). */
   tightBox(id: number, out: AABB): AABB {
     this.assertLeaf(id);

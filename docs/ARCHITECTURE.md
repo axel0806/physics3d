@@ -67,7 +67,7 @@ approach beyond the gap. It needs no time-of-impact search and works with the wh
 (friction, stacking), but it builds the contact from the closest feature at the start of the step.
 For fast oblique motion that feature can be the wrong one (a wall's edge instead of its face), and
 a contact made at the moment of impact has no restitution. Measured on 500 m/s shots at a 1 cm
-wall: discrete 46% tunnel, speculative 5.5%, sweep 0% (10,000 shots).
+wall: discrete 46% tunnel, speculative 11.8%, sweep 0% (10,000 shots).
 
 **Joints.** `src/constraints` holds ball, hinge, slider, fixed, distance/spring and cone-twist joints.
 Each is a set of scalar `Row`s plus 3x3 block locks (`PointLock`, `AngularLock`). Joints are solved

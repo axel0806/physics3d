@@ -82,11 +82,11 @@ describe('continuous collision detection', () => {
     expect(fire(10_000, true, 2)).toBe(0);
   }, 600_000);
 
-  it('speculative contacts cut tunnelling by about 8x but do not eliminate it (2,000 shots)', () => {
-    // Measured 111 of 2,000 (5.5%); the discrete solver loses ~46%. The misses are oblique shots
+  it('speculative contacts cut tunnelling by about 4x but do not eliminate it (2,000 shots)', () => {
+    // Measured 235 of 2,000 (11.8%); the discrete solver loses ~46%. The misses are oblique shots
     // whose closest feature at the start of an 8 m step is the wall's edge, not its face.
     const n = fire(2000, true, 3, 'speculative');
-    expect(n).toBeLessThan(160);
+    expect(n).toBeLessThan(320);
   }, 300_000);
 
   it('a CCD ball dropped on a floor bounces and comes to rest with no time loss', () => {

@@ -62,7 +62,7 @@ of `pnpm test` (default sample sizes) passed 119 tests across 12 files, and `pnp
   Per-body flag `ccd`. Comparison written up in `docs/ARCHITECTURE.md`.
 - Acceptance: a 5 cm sphere at 500 m/s against a 1 cm wall (randomly tilted, random aim and approach
   angle up to 60 degrees, 60 Hz): 0 tunnelled in 10,000 shots (`tests/physics/ccd.test.ts`). Without
-  CCD 46% tunnel (so the test has teeth); speculative mode 5.5%, documented, test bound 8%.
+  CCD 46% tunnel (so the test has teeth); speculative mode 11.8%, documented, test bound 16%.
 - No time loss: a CCD ball dropped on a floor settles in the same time as the discrete one, and a slow
   CCD ball takes the identical path as a non-CCD ball (bit-equal position).
 - Limits: other bodies are stationary during the sweep, rotation is not swept, no friction at impact.

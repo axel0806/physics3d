@@ -15,7 +15,9 @@ import { Sphere, Triangle, TriangleMesh } from '../shapes';
 import type { Placed } from '../collision/narrowphase';
 import { BroadPhase, pairKey } from '../collision/broadphase';
 import { Joint } from '../constraints/joint';
-import { manifoldOf } from '../collision/pairs';
+import { manifoldOf, swapManifold } from '../collision/pairs';
+import { convexTriangleContact } from '../collision/narrowphase/triangleContact';
+import { ContactBatch } from '../solver/batch';
 import { gjk } from '../collision/narrowphase';
 import type { ContactManifold } from '../collision/narrowphase/contact';
 import { timeOfImpact, type TimeOfImpact } from '../collision/toi';
@@ -140,7 +142,12 @@ export class World {
   readonly joints: Joint[] = [];
   readonly broadphase = new BroadPhase(0.1);
   velocityIterations: number;
+  /** Never stop before this many iterations, and stop once no impulse moves a speed more than `velocityTolerance` (m/s). */
+  minVelocityIterations = 4;
+  velocityTolerance = 1e-5;
   positionIterations: number;
+  /** Position passes over contacts (joints use `positionIterations`); fewer calms dense piles. */
+  contactPositionIterations = 4;
   restitutionThreshold: number;
   baumgarte: number;
   linearSlop: number;
@@ -561,6 +568,7 @@ export class World {
   clock: (() => number) | null = null;
   readonly timings = { broadphase: 0, narrowphase: 0, solve: 0, integrate: 0 };
   private lapTime = 0;
+  private readonly batch = new ContactBatch();
 
   private lap(phase: keyof World['timings']): void {
     if (!this.clock) return;
@@ -601,15 +609,31 @@ export class World {
       j.warmStart();
     }
     const ordered = this.orderedContacts();
+    // Worlds without joints iterate on flat arrays (ContactBatch). Joints are solved on the
+    // bodies directly, interleaved with the contacts, so jointed worlds keep the object solver.
+    const batched = this.joints.length === 0;
     for (const c of ordered) {
       if (!this.constraintActive(c)) continue;
       prepareContact(c, this.restitutionThreshold, dt);
       buildNormalK(c);
-      warmStart(c);
+      if (!batched) warmStart(c);
     }
-    for (let it = 0; it < this.velocityIterations; it++) {
-      for (const j of this.joints) if (j.active) j.solveVelocity(dt);
-      for (const c of ordered) if (this.constraintActive(c)) solveVelocity(c);
+    if (batched) {
+      const batch = this.batch;
+      batch.gather(ordered);
+      batch.warmStart();
+      // A resting pile with warm starting converges in a handful of iterations; the rest would
+      // change nothing. Joints do not report convergence, so jointed worlds run every iteration.
+      for (let it = 0; it < this.velocityIterations; it++) {
+        batch.iterate();
+        if (it >= this.minVelocityIterations && batch.maxChange < this.velocityTolerance) break;
+      }
+      batch.scatter();
+    } else {
+      for (let it = 0; it < this.velocityIterations; it++) {
+        for (const j of this.joints) if (j.active) j.solveVelocity(dt);
+        for (const c of ordered) if (this.constraintActive(c)) solveVelocity(c);
+      }
     }
     this.lap('solve');
     // Jointed bodies rotate after the solve, from the same pose the joints were evaluated at;
@@ -626,15 +650,17 @@ export class World {
     this.lap('integrate');
     const feedback = new Map<RigidBody, [Vec3, Vec3]>();
     for (let it = 0; it < this.positionIterations; it++) {
-      for (const c of ordered) {
-        if (this.constraintActive(c)) solvePosition(c, this.baumgarte, this.linearSlop);
+      if (it < this.contactPositionIterations) {
+        for (const c of ordered) {
+          if (this.constraintActive(c)) solvePosition(c, this.baumgarte, this.linearSlop);
+        }
       }
       for (const j of this.joints) if (j.active) j.solveLimits();
       for (const j of this.joints) if (j.active) this.correctJoint(j, feedback);
     }
     this.applyFeedback(feedback, dt);
     this.lap('solve');
-    for (const body of this.bodies) body.updateWorldInertia();
+    for (const body of this.bodies) if (body.isSimulated) body.updateWorldInertia();
     this.updateSleep(dt);
     this.lap('integrate');
     this.frame++;
@@ -789,12 +815,19 @@ export class World {
     return c.bodyA.isSimulated || c.bodyB.isSimulated;
   }
 
+  /** World-space bounding box of a collider at its current pose (for debug drawing and queries). */
+  colliderBounds(c: Collider): AABB {
+    return this.worldBounds(c);
+  }
+
   private worldBounds(c: Collider): AABB {
     return placedBounds(c.shape, c.body.colliderTransform(c, new Transform()));
   }
 
   private updateBroadphase(dt: number): void {
     for (const c of this.colliders) {
+      // Static and sleeping bodies do not move; their proxies stay as they are.
+      if (!c.body.isSimulated && c.body.type !== 'kinematic') continue;
       const proxy = this.colliderProxy.get(c);
       if (proxy === undefined) continue;
       const box = this.worldBounds(c);
@@ -877,13 +910,27 @@ export class World {
       if (!(area2 > 1e-12)) continue; // degenerate triangle
       V.scale(nTri, nTri, 1 / area2);
       Q.rotate(nTri, tm.q, nTri);
-      const shapeM = { shape: new Triangle(pts[0], pts[1], pts[2]), transform: tm };
       const shapeO = { shape: co.shape, transform: to };
-      const m = meshIsA ? manifoldOf(shapeM, shapeO) : manifoldOf(shapeO, shapeM);
-      if (!m) continue;
-      // Contacts with an edge or vertex of a triangle can point sideways; those belong to the
-      // neighbouring face, so they are dropped rather than allowed to snag a sliding body.
-      if (Math.abs(V.dot(m.normal, nTri)) < 0.5) continue;
+      // Fast path: face-normal contact from the shape's lowest points over this triangle.
+      const fast = convexTriangleContact(
+        shapeO,
+        T.apply(new Vec3(), tm, pts[0]),
+        T.apply(new Vec3(), tm, pts[1]),
+        T.apply(new Vec3(), tm, pts[2]),
+        0.5 * this.linearSlop,
+      );
+      if (fast === 'clear') continue;
+      let m: ContactManifold | null;
+      if (fast !== 'unsure') {
+        m = meshIsA ? fast : swapManifold(fast);
+      } else {
+        // The shape overlaps the plane without a point over the triangle: an edge or vertex
+        // contact. GJK/EPA decides; sideways normals belong to the neighbouring face and are
+        // dropped rather than allowed to snag a sliding body.
+        const shapeM = { shape: new Triangle(pts[0], pts[1], pts[2]), transform: tm };
+        m = meshIsA ? manifoldOf(shapeM, shapeO) : manifoldOf(shapeO, shapeM);
+        if (!m || Math.abs(V.dot(m.normal, nTri)) < 0.5) continue;
+      }
       const old = subs?.get(tri + 1);
       const c = this.makeConstraint(ca, cb, m, old, tri + 1);
       next.set(tri + 1, c);
@@ -1013,35 +1060,40 @@ export class World {
 
   /** Puts islands of slow bodies to sleep, using union-find over active contacts. */
   private updateSleep(dt: number): void {
-    const parent = new Map<RigidBody, RigidBody>();
+    // Union-find over the bodies, with the parent links stored on the bodies themselves.
     const find = (b: RigidBody): RigidBody => {
       let r = b;
-      while ((parent.get(r) ?? r) !== r) r = parent.get(r) as RigidBody;
+      while (r.islandParent !== r) {
+        r.islandParent = r.islandParent.islandParent;
+        r = r.islandParent;
+      }
       return r;
     };
-    for (const body of this.bodies) parent.set(body, body);
+    for (const body of this.bodies) {
+      body.islandParent = body;
+      body.islandMin = Infinity;
+    }
     // Islands connect through dynamic bodies only: a shared static floor or anchor must not merge
     // unrelated groups.
     const link = (a: RigidBody, b: RigidBody): void => {
       if (!a.isDynamic || !b.isDynamic) return;
       const ra = find(a);
       const rb = find(b);
-      if (ra !== rb) parent.set(ra, rb);
+      if (ra !== rb) ra.islandParent = rb;
     };
     this.forEachContact((c) => link(c.bodyA, c.bodyB));
     for (const j of this.joints) link(j.bodyA, j.bodyB);
-    const islandMinSleep = new Map<RigidBody, number>();
     for (const body of this.bodies) {
       if (!body.isDynamic) continue;
       const slow =
         V.lengthSq(body.linearVelocity) < 1e-4 && V.lengthSq(body.angularVelocity) < 1e-4;
       body.sleepTime = slow ? body.sleepTime + dt : 0;
       const root = find(body);
-      islandMinSleep.set(root, Math.min(islandMinSleep.get(root) ?? Infinity, body.sleepTime));
+      root.islandMin = Math.min(root.islandMin, body.sleepTime);
     }
     for (const body of this.bodies) {
       if (!body.isDynamic || !body.awake) continue;
-      const ready = (islandMinSleep.get(find(body)) ?? 0) >= this.sleepTimeLimit;
+      const ready = find(body).islandMin >= this.sleepTimeLimit;
       if (ready) {
         body.awake = false;
         body.linearVelocity.x = body.linearVelocity.y = body.linearVelocity.z = 0;

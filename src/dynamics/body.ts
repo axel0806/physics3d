@@ -72,6 +72,12 @@ export class RigidBody {
   /** Pose at the start of the last step, for render interpolation. */
   readonly prevPosition: Vec3;
   readonly prevOrientation: Quat;
+  /** Scratch for the batch solver: slot in the current batch, valid when the stamp matches. */
+  batchIndex = 0;
+  batchStamp = 0;
+  /** Scratch for sleep islands (union-find parent and the island smallest sleep timer). */
+  islandParent: RigidBody = this;
+  islandMin = 0;
   /** Number of joints attached; jointed bodies rotate after the constraint solve. */
   jointCount = 0;
   /** Sleep bookkeeping. */
@@ -139,10 +145,37 @@ export class RigidBody {
 
   /** Recomputes the world inverse inertia for an arbitrary orientation (e.g. the predicted mid-step pose). */
   updateWorldInertiaFrom(q: Quat): void {
-    const rot = new Mat3();
-    M3.fromQuat(rot, q);
-    const tmp = M3.mul(new Mat3(), rot, this.localInvInertia);
-    M3.mul(this.worldInvInertia, tmp, rot.transpose());
+    // R * invI * R^T with R built from the unit quaternion, in scalar arithmetic.
+    const { x, y, z, w } = q;
+    const r00 = 1 - 2 * (y * y + z * z);
+    const r01 = 2 * (x * y - z * w);
+    const r02 = 2 * (x * z + y * w);
+    const r10 = 2 * (x * y + z * w);
+    const r11 = 1 - 2 * (x * x + z * z);
+    const r12 = 2 * (y * z - x * w);
+    const r20 = 2 * (x * z - y * w);
+    const r21 = 2 * (y * z + x * w);
+    const r22 = 1 - 2 * (x * x + y * y);
+    const i = this.localInvInertia.e;
+    const t00 = r00 * (i[0] as number) + r01 * (i[3] as number) + r02 * (i[6] as number);
+    const t01 = r00 * (i[1] as number) + r01 * (i[4] as number) + r02 * (i[7] as number);
+    const t02 = r00 * (i[2] as number) + r01 * (i[5] as number) + r02 * (i[8] as number);
+    const t10 = r10 * (i[0] as number) + r11 * (i[3] as number) + r12 * (i[6] as number);
+    const t11 = r10 * (i[1] as number) + r11 * (i[4] as number) + r12 * (i[7] as number);
+    const t12 = r10 * (i[2] as number) + r11 * (i[5] as number) + r12 * (i[8] as number);
+    const t20 = r20 * (i[0] as number) + r21 * (i[3] as number) + r22 * (i[6] as number);
+    const t21 = r20 * (i[1] as number) + r21 * (i[4] as number) + r22 * (i[7] as number);
+    const t22 = r20 * (i[2] as number) + r21 * (i[5] as number) + r22 * (i[8] as number);
+    const o = this.worldInvInertia.e;
+    o[0] = t00 * r00 + t01 * r01 + t02 * r02;
+    o[1] = t00 * r10 + t01 * r11 + t02 * r12;
+    o[2] = t00 * r20 + t01 * r21 + t02 * r22;
+    o[3] = t10 * r00 + t11 * r01 + t12 * r02;
+    o[4] = t10 * r10 + t11 * r11 + t12 * r12;
+    o[5] = t10 * r20 + t11 * r21 + t12 * r22;
+    o[6] = t20 * r00 + t21 * r01 + t22 * r02;
+    o[7] = t20 * r10 + t21 * r11 + t22 * r12;
+    o[8] = t20 * r20 + t21 * r21 + t22 * r22;
   }
 
   /** Velocity of the material point at world offset r from the center of mass. */

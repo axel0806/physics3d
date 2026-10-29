@@ -20,7 +20,7 @@ function segment(c: Capsule, t: Transform): [Vec3, Vec3] {
   return [V.sub(new Vec3(), t.p, up), V.add(new Vec3(), t.p, up)];
 }
 
-function swapManifold(m: ContactManifold): ContactManifold {
+export function swapManifold(m: ContactManifold): ContactManifold {
   return {
     normal: V.negate(new Vec3(), m.normal),
     points: m.points.map((p) => ({
