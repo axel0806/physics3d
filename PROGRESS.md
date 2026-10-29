@@ -143,6 +143,34 @@ by about 10%; the baseline was recorded on a quiet machine).
 - 8 ms for the whole pile step is not reachable by the solver alone: the solve floor is about
   14 ms at 6 iterations on this machine.
 
+## Phase 9 solve-phase pass 2 (pile-1000-boxes)
+
+- `ContactBatch` now stores per-point Jacobian rows (angular Jacobian J and I^-1 J for the normal and
+  both tangents), so a row costs a few multiply-adds, and `iterate` keeps both bodies' velocities in
+  locals for a whole constraint (one load and one store per body instead of per point). The 4-point
+  normal matrix is built from the same rows (symmetric half only).
+- Multi-point normal blocks: all-active case solved with a precomputed K^-1 (lambda = lambda_old -
+  K^-1 (speed error), no K product, so no cancellation); otherwise principal pivoting starting from the
+  points that carried load last time (exhaustive search only if it cycles). The solution is unique
+  because K is positive definite. Tower and pyramid tests are unchanged.
+- Constraints whose two bodies no other constraint has moved since they last settled are skipped
+  (`skipTolerance` 1e-5 m/s). It helps resting stacks at 40 iterations; in the falling pile nothing
+  converges below 5 mm/s within 10 iterations, so it saves nothing there.
+- Measured (min of 3, same tree, quiet machine, bench scene, 10 iterations): solve phase 14.5 ms ->
+  9.3 ms. Breakdown now: prepare 2.3, iterate 4.9 (0.48 per pass: normal rows 0.29, friction 0.19),
+  scatter 0.35, position passes 0.35, contact ordering 0.5.
+- Iteration count: 10 is the best setting for the whole step. 6 iterations cost less per step but the
+  pile stays awake longer (545 awake bodies at step 360 vs 67), so the median is worse (31 vs 25 ms).
+  Stacking quality versus `velocityIterations` (20-box tower drift / 55-box pyramid drift, 120 Hz, 10 s):
+  40: 2.9 / 0.9 mm; 10: 12.7 / 7.4 mm; 6: 21.5 / 16 mm; 4: 33 / 26 mm.
+- Tried and rejected: sorting contacts by height (top-down) for faster Gauss-Seidel propagation: no
+  change in tower sag or time to sleep.
+- Finding: the pile median is set by when it falls asleep, not by per-step cost. With
+  `contactPositionIterations = 0` the whole pile sleeps by step ~350 and the step median is 4.6 ms, but
+  boxes interpenetrate by up to 0.5 m, so it is not a fix. The NGS position pass (5 mm slop, mean
+  settled penetration 4-5 mm) keeps the heap awake; a softer or hysteretic position correction (or
+  split impulse with a larger slop) is the lever for 8 ms, not more solver speed.
+
 ## Known limitations (carry-forward)
 
 1. **Near-flat hulls (thickness ratio ≲ 1e-4)**: quickhull can accept a near-duplicate vertex in a
@@ -194,8 +222,14 @@ by about 10%; the baseline was recorded on a quiet machine).
     group), and wake-on-contact only for moving or kinematic bodies. Result: the 400-box pile is fully
     asleep at 11.7 s (test bound 20 s, runs in about 30 s); the bench 1000-box pile is 31 percent asleep
     at 4 s, 77 percent at 6 s and 96 percent at 20 s, but not monotonic (individual bodies keep waking
-    neighbours, so it does not reach 100 percent). The ragdoll heap explodes with a 4 mm margin (a
-    solver instability under heavy impulses that was not root-caused); 2 mm is the tested value.
+    neighbours, so it does not reach 100 percent). The ragdoll heap exploding with a 4 mm margin was root-caused: not
+    the margin but the gyroscopic integrator. Its implicit-midpoint fixed point diverges once dt*|w| is
+    large (a limb spinning at about 180 rad/s at 60 Hz), and 60 diverging iterations turned that into
+    thousands of rad/s; the margin only perturbed the chaotic heap into that state. Fixed by iterating to
+    convergence and falling back to one Newton (linearised implicit Euler) step on non-convergence
+    (test: `gyroscopic integration at large dt*|w|`). 2 to 6 mm margins now agree (max speed 28 m/s).
+    Sleep timers also use hysteresis now (hold between 1x and 2x the sleep speeds, reset above 2x), which
+    took the bench pile from 351 to 90 awake bodies at 6 s.
     Position correction still injects some energy in the first seconds; a split-impulse or soft contact
     solver would be the real fix.
 

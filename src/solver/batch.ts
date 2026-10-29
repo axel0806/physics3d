@@ -34,18 +34,29 @@ export class ContactBatch {
   private cPointCount = new Int32Array(64);
   private cKStart = new Int32Array(64);
   private K = new Float64Array(16 * 64);
+  private Kinv = new Float64Array(16 * 64);
+  private cKValid = new Int32Array(64);
   private constraints: ContactConstraint[] = [];
   private constraintCount = 0;
 
   // Points.
-  private pRA = new Float64Array(3 * 256);
-  private pRB = new Float64Array(3 * 256);
+  // Per point and row (normal, tangent 1, tangent 2): 12 doubles, JA (3), JB (3), IJA (3), IJB (3),
+  // where J = r x d is the angular Jacobian and IJ = I^-1 J, so a row costs a few multiply-adds.
+  private pJ = new Float64Array(36 * 256);
   private pMass = new Float64Array(3 * 256); // normal, tangent 1, tangent 2
   private pImpulse = new Float64Array(3 * 256);
   private pTarget = new Float64Array(256);
   private pSA = new Float64Array(3 * 256); // surface anchor offsets (position solve)
   private pSB = new Float64Array(3 * 256);
   private pos = new Float64Array(3 * 64);
+
+  // Per-body change counters and per-constraint snapshots: a constraint whose two bodies were not
+  // moved by any other constraint since it last settled cannot change anything and is skipped.
+  private bodyMod = new Int32Array(64);
+  private cSeen = new Int32Array(64);
+
+  /** An impulse change that moves a speed by less than this (m/s) counts as converged. */
+  skipTolerance = 1e-5;
 
   /** Largest speed change caused by an impulse update since the last `iterate` began. */
   maxChange = 0;
@@ -56,6 +67,7 @@ export class ContactBatch {
     this.lin = grow(this.lin, 3 * cap);
     this.ang = grow(this.ang, 3 * cap);
     this.pos = grow(this.pos, 3 * cap);
+    this.bodyMod = grow(this.bodyMod, cap);
     this.invMass = grow(this.invMass, cap);
     this.invInertia = grow(this.invInertia, 9 * cap);
   }
@@ -72,17 +84,20 @@ export class ContactBatch {
       this.cPointStart = grow(this.cPointStart, cap);
       this.cPointCount = grow(this.cPointCount, cap);
       this.cKStart = grow(this.cKStart, cap);
+      this.cSeen = grow(this.cSeen, cap);
+      this.cKValid = grow(this.cKValid, cap);
     }
     if (kn > this.K.length) {
-      this.K = grow(this.K, Math.max(kn, this.K.length * 2));
+      const cap = Math.max(kn, this.K.length * 2);
+      this.K = grow(this.K, cap);
+      this.Kinv = grow(this.Kinv, cap);
     }
   }
 
   private growPoints(n: number): void {
     if (n <= this.pTarget.length) return;
     const cap = Math.max(n, this.pTarget.length * 2);
-    this.pRA = grow(this.pRA, 3 * cap);
-    this.pRB = grow(this.pRB, 3 * cap);
+    this.pJ = grow(this.pJ, 36 * cap);
     this.pMass = grow(this.pMass, 3 * cap);
     this.pImpulse = grow(this.pImpulse, 3 * cap);
     this.pTarget = grow(this.pTarget, cap);
@@ -94,6 +109,8 @@ export class ContactBatch {
     if (b.batchStamp === this.stamp) return b.batchIndex;
     b.batchStamp = this.stamp;
     const i = this.bodyCount++;
+    this.growBodies(i + 1);
+    this.bodyMod[i] = 0;
     b.batchIndex = i;
     this.bodies[i] = b;
     this.growBodies(i + 1);
@@ -117,9 +134,9 @@ export class ContactBatch {
 
   /**
    * Builds the arrays straight from the constraints and the current poses: offsets from the
-   * centers of mass, effective masses along normal and tangents, the coupled normal matrix and the
-   * restitution target (the arithmetic of `prepareContact` and `buildNormalK`, without the
-   * intermediate objects). Also writes `rA`/`rB` back to the points for debug drawing.
+   * centers of mass, the Jacobian rows (angular Jacobians and their inverse-inertia products),
+   * effective masses along normal and tangents, the coupled normal matrix and the restitution
+   * target. Also writes `rA`/`rB` back to the points for debug drawing.
    */
   prepare(contacts: readonly ContactConstraint[], threshold: number, dt: number): void {
     this.stamp++;
@@ -136,6 +153,7 @@ export class ContactBatch {
     }
     this.growConstraints(active, kSize);
     this.growPoints(points);
+    const J = this.pJ;
     let k = 0;
     let q = 0;
     let kOff = 0;
@@ -146,6 +164,7 @@ export class ContactBatch {
       this.constraints.push(c);
       this.cBodyA[k] = this.slot(bodyA);
       this.cBodyB[k] = this.slot(bodyB);
+      this.cSeen[k] = -1;
       const nx = c.normal.x;
       const ny = c.normal.y;
       const nz = c.normal.z;
@@ -207,30 +226,53 @@ export class ContactBatch {
         const rbx = midx - pb.x;
         const rby = midy - pb.y;
         const rbz = midz - pb.z;
-        this.pRA[o] = rax;
-        this.pRA[o + 1] = ray;
-        this.pRA[o + 2] = raz;
-        this.pRB[o] = rbx;
-        this.pRB[o + 1] = rby;
-        this.pRB[o + 2] = rbz;
         p.rA.x = rax;
         p.rA.y = ray;
         p.rA.z = raz;
         p.rB.x = rbx;
         p.rB.y = rby;
         p.rB.z = rbz;
+        const jo = 36 * (q + i);
         const mN =
-          base +
-          (aSim ? invDot(ea, rax, ray, raz, nx, ny, nz) : 0) +
-          (bSim ? invDot(eb, rbx, rby, rbz, nx, ny, nz) : 0);
+          base + jacobianRow(J, jo, aSim, ea, bSim, eb, rax, ray, raz, rbx, rby, rbz, nx, ny, nz);
         const m1 =
           base +
-          (aSim ? invDot(ea, rax, ray, raz, t1.x, t1.y, t1.z) : 0) +
-          (bSim ? invDot(eb, rbx, rby, rbz, t1.x, t1.y, t1.z) : 0);
+          jacobianRow(
+            J,
+            jo + 12,
+            aSim,
+            ea,
+            bSim,
+            eb,
+            rax,
+            ray,
+            raz,
+            rbx,
+            rby,
+            rbz,
+            t1.x,
+            t1.y,
+            t1.z,
+          );
         const m2 =
           base +
-          (aSim ? invDot(ea, rax, ray, raz, t2.x, t2.y, t2.z) : 0) +
-          (bSim ? invDot(eb, rbx, rby, rbz, t2.x, t2.y, t2.z) : 0);
+          jacobianRow(
+            J,
+            jo + 24,
+            aSim,
+            ea,
+            bSim,
+            eb,
+            rax,
+            ray,
+            raz,
+            rbx,
+            rby,
+            rbz,
+            t2.x,
+            t2.y,
+            t2.z,
+          );
         this.pMass[o] = mN > 0 ? 1 / mN : 0;
         this.pMass[o + 1] = m1 > 0 ? 1 / m1 : 0;
         this.pMass[o + 2] = m2 > 0 ? 1 / m2 : 0;
@@ -246,46 +288,30 @@ export class ContactBatch {
         this.pImpulse[o + 1] = p.impulseT1;
         this.pImpulse[o + 2] = p.impulseT2;
       }
-      // Coupled normal matrix, with the small diagonal term that keeps coplanar blocks well posed.
+      // Coupled normal matrix (symmetric), with the small diagonal term that keeps coplanar blocks
+      // well posed: K_ij = invMass terms + JA_i . IJA_j + JB_i . IJB_j on the normal rows.
       let maxDiag = 0;
       for (let i = 0; i < n; i++) {
-        const oi = 3 * (q + i);
-        for (let j = 0; j < n; j++) {
-          const oj = 3 * (q + j);
-          let kk = base;
-          if (aSim)
-            kk += crossDot(
-              ea,
-              this.pRA[oi] as number,
-              this.pRA[oi + 1] as number,
-              this.pRA[oi + 2] as number,
-              this.pRA[oj] as number,
-              this.pRA[oj + 1] as number,
-              this.pRA[oj + 2] as number,
-              nx,
-              ny,
-              nz,
-            );
-          if (bSim)
-            kk += crossDot(
-              eb,
-              this.pRB[oi] as number,
-              this.pRB[oi + 1] as number,
-              this.pRB[oi + 2] as number,
-              this.pRB[oj] as number,
-              this.pRB[oj + 1] as number,
-              this.pRB[oj + 2] as number,
-              nx,
-              ny,
-              nz,
-            );
+        const ji = 36 * (q + i);
+        for (let j = i; j < n; j++) {
+          const jj = 36 * (q + j);
+          const kk =
+            base +
+            (J[ji] as number) * (J[jj + 6] as number) +
+            (J[ji + 1] as number) * (J[jj + 7] as number) +
+            (J[ji + 2] as number) * (J[jj + 8] as number) +
+            (J[ji + 3] as number) * (J[jj + 9] as number) +
+            (J[ji + 4] as number) * (J[jj + 10] as number) +
+            (J[ji + 5] as number) * (J[jj + 11] as number);
           this.K[kOff + i * n + j] = kk;
+          this.K[kOff + j * n + i] = kk;
           if (i === j && kk > maxDiag) maxDiag = kk;
         }
       }
       const eps = 1e-9 * maxDiag;
       for (let i = 0; i < n; i++)
         this.K[kOff + i * n + i] = (this.K[kOff + i * n + i] as number) + eps;
+      this.cKValid[k] = n > 1 && n <= BLOCK_MAX && invert(this.K, kOff, n, this.Kinv) ? 1 : 0;
       kOff += n * n;
       q += n;
       k++;
@@ -363,9 +389,14 @@ export class ContactBatch {
 
   /** Re-applies the accumulated impulses from the previous step. */
   warmStart(): void {
+    const lin = this.lin;
+    const ang = this.ang;
+    const J = this.pJ;
     for (let k = 0; k < this.constraintCount; k++) {
       const a = this.cBodyA[k] as number;
       const b = this.cBodyB[k] as number;
+      const imA = this.invMass[a] as number;
+      const imB = this.invMass[b] as number;
       const nx = this.cNormal[3 * k] as number;
       const ny = this.cNormal[3 * k + 1] as number;
       const nz = this.cNormal[3 * k + 2] as number;
@@ -381,292 +412,273 @@ export class ContactBatch {
         const jn = this.pImpulse[3 * q] as number;
         const j1 = this.pImpulse[3 * q + 1] as number;
         const j2 = this.pImpulse[3 * q + 2] as number;
-        this.applyPair(
-          a,
-          b,
-          q,
-          nx * jn + t1x * j1 + t2x * j2,
-          ny * jn + t1y * j1 + t2y * j2,
-          nz * jn + t1z * j1 + t2z * j2,
-        );
+        const px = nx * jn + t1x * j1 + t2x * j2;
+        const py = ny * jn + t1y * j1 + t2y * j2;
+        const pz = nz * jn + t1z * j1 + t2z * j2;
+        const o = 36 * q;
+        lin[3 * a] = (lin[3 * a] as number) - px * imA;
+        lin[3 * a + 1] = (lin[3 * a + 1] as number) - py * imA;
+        lin[3 * a + 2] = (lin[3 * a + 2] as number) - pz * imA;
+        lin[3 * b] = (lin[3 * b] as number) + px * imB;
+        lin[3 * b + 1] = (lin[3 * b + 1] as number) + py * imB;
+        lin[3 * b + 2] = (lin[3 * b + 2] as number) + pz * imB;
+        for (let c = 0; c < 3; c++) {
+          ang[3 * a + c] =
+            (ang[3 * a + c] as number) -
+            ((J[o + 6 + c] as number) * jn +
+              (J[o + 18 + c] as number) * j1 +
+              (J[o + 30 + c] as number) * j2);
+          ang[3 * b + c] =
+            (ang[3 * b + c] as number) +
+            ((J[o + 9 + c] as number) * jn +
+              (J[o + 21 + c] as number) * j1 +
+              (J[o + 33 + c] as number) * j2);
+        }
       }
     }
-  }
-
-  /** One sequential-impulse pass over every constraint (normals as a block, then friction). */
-  iterate(): void {
-    this.maxChange = 0;
-    for (let k = 0; k < this.constraintCount; k++) this.solveConstraint(k);
-  }
-
-  private solveConstraint(k: number): void {
-    const a = this.cBodyA[k] as number;
-    const b = this.cBodyB[k] as number;
-    const nx = this.cNormal[3 * k] as number;
-    const ny = this.cNormal[3 * k + 1] as number;
-    const nz = this.cNormal[3 * k + 2] as number;
-    const start = this.cPointStart[k] as number;
-    const n = this.cPointCount[k] as number;
-    const end = start + n;
-    if (n > 1 && n <= BLOCK_MAX && this.solveBlock(k, a, b, nx, ny, nz, start, n)) {
-      // Block solution applied.
-    } else {
-      for (let q = start; q < end; q++) {
-        const vn = this.speedAlong(a, b, q, nx, ny, nz);
-        const old = this.pImpulse[3 * q] as number;
-        const mass = this.pMass[3 * q] as number;
-        const next = Math.max(0, old + ((this.pTarget[q] as number) - vn) * mass);
-        const d = next - old;
-        this.pImpulse[3 * q] = next;
-        if (mass > 0) this.track(Math.abs(d) / mass);
-        this.applyPair(a, b, q, nx * d, ny * d, nz * d);
-      }
-    }
-    const mu = this.cFriction[k] as number;
-    const t1x = this.cTan1[3 * k] as number;
-    const t1y = this.cTan1[3 * k + 1] as number;
-    const t1z = this.cTan1[3 * k + 2] as number;
-    const t2x = this.cTan2[3 * k] as number;
-    const t2y = this.cTan2[3 * k + 1] as number;
-    const t2z = this.cTan2[3 * k + 2] as number;
-    const lin = this.lin;
-    const ang = this.ang;
-    const pI = this.pImpulse;
-    const pM = this.pMass;
-    const pRA = this.pRA;
-    const pRB = this.pRB;
-    for (let q = start; q < end; q++) {
-      const acc1 = pI[3 * q + 1] as number;
-      const acc2 = pI[3 * q + 2] as number;
-      const maxF = mu * (pI[3 * q] as number);
-      // No normal load and nothing accumulated: the clamped impulse is exactly zero.
-      if (maxF === 0 && acc1 === 0 && acc2 === 0) continue;
-      const m1 = pM[3 * q + 1] as number;
-      const m2 = pM[3 * q + 2] as number;
-      const rx = pRA[3 * q] as number;
-      const ry = pRA[3 * q + 1] as number;
-      const rz = pRA[3 * q + 2] as number;
-      const sx = pRB[3 * q] as number;
-      const sy = pRB[3 * q + 1] as number;
-      const sz = pRB[3 * q + 2] as number;
-      // Relative velocity of the point once, then both tangent speeds from it.
-      const wax = ang[3 * a] as number;
-      const way = ang[3 * a + 1] as number;
-      const waz = ang[3 * a + 2] as number;
-      const wbx = ang[3 * b] as number;
-      const wby = ang[3 * b + 1] as number;
-      const wbz = ang[3 * b + 2] as number;
-      const vx =
-        (lin[3 * b] as number) +
-        (wby * sz - wbz * sy) -
-        (lin[3 * a] as number) -
-        (way * rz - waz * ry);
-      const vy =
-        (lin[3 * b + 1] as number) +
-        (wbz * sx - wbx * sz) -
-        (lin[3 * a + 1] as number) -
-        (waz * rx - wax * rz);
-      const vz =
-        (lin[3 * b + 2] as number) +
-        (wbx * sy - wby * sx) -
-        (lin[3 * a + 2] as number) -
-        (wax * ry - way * rx);
-      // Both tangent velocities are cancelled together, then the 2D impulse is bounded by the
-      // Coulomb cone (norm <= mu N), so friction is isotropic.
-      let n1 = acc1 - (vx * t1x + vy * t1y + vz * t1z) * m1;
-      let n2 = acc2 - (vx * t2x + vy * t2y + vz * t2z) * m2;
-      const lenSq = n1 * n1 + n2 * n2;
-      if (lenSq > maxF * maxF) {
-        const sc = maxF / Math.sqrt(lenSq);
-        n1 *= sc;
-        n2 *= sc;
-      }
-      const d1 = n1 - acc1;
-      const d2 = n2 - acc2;
-      if (d1 === 0 && d2 === 0) continue;
-      if (m1 > 0) this.track(Math.abs(d1) / m1);
-      if (m2 > 0) this.track(Math.abs(d2) / m2);
-      pI[3 * q + 1] = n1;
-      pI[3 * q + 2] = n2;
-      this.applyPair(a, b, q, t1x * d1 + t2x * d2, t1y * d1 + t2y * d2, t1z * d1 + t2z * d2);
-    }
-  }
-
-  private track(dv: number): void {
-    if (dv > this.maxChange) this.maxChange = dv;
-  }
-
-  /** Speed of body B relative to body A at point q along (dx, dy, dz). */
-  private speedAlong(a: number, b: number, q: number, dx: number, dy: number, dz: number): number {
-    const lin = this.lin;
-    const ang = this.ang;
-    const rx = this.pRA[3 * q] as number;
-    const ry = this.pRA[3 * q + 1] as number;
-    const rz = this.pRA[3 * q + 2] as number;
-    const sx = this.pRB[3 * q] as number;
-    const sy = this.pRB[3 * q + 1] as number;
-    const sz = this.pRB[3 * q + 2] as number;
-    const wax = ang[3 * a] as number;
-    const way = ang[3 * a + 1] as number;
-    const waz = ang[3 * a + 2] as number;
-    const wbx = ang[3 * b] as number;
-    const wby = ang[3 * b + 1] as number;
-    const wbz = ang[3 * b + 2] as number;
-    const vx =
-      (lin[3 * b] as number) +
-      (wby * sz - wbz * sy) -
-      (lin[3 * a] as number) -
-      (way * rz - waz * ry);
-    const vy =
-      (lin[3 * b + 1] as number) +
-      (wbz * sx - wbx * sz) -
-      (lin[3 * a + 1] as number) -
-      (waz * rx - wax * rz);
-    const vz =
-      (lin[3 * b + 2] as number) +
-      (wbx * sy - wby * sx) -
-      (lin[3 * a + 2] as number) -
-      (wax * ry - way * rx);
-    return vx * dx + vy * dy + vz * dz;
-  }
-
-  /** Applies +P to body B and −P to body A at the offsets of point q. */
-  private applyPair(a: number, b: number, q: number, px: number, py: number, pz: number): void {
-    this.apply(
-      a,
-      -px,
-      -py,
-      -pz,
-      this.pRA[3 * q] as number,
-      this.pRA[3 * q + 1] as number,
-      this.pRA[3 * q + 2] as number,
-    );
-    this.apply(
-      b,
-      px,
-      py,
-      pz,
-      this.pRB[3 * q] as number,
-      this.pRB[3 * q + 1] as number,
-      this.pRB[3 * q + 2] as number,
-    );
-  }
-
-  private apply(
-    i: number,
-    px: number,
-    py: number,
-    pz: number,
-    rx: number,
-    ry: number,
-    rz: number,
-  ): void {
-    const im = this.invMass[i] as number;
-    if (im === 0) return;
-    const lin = this.lin;
-    lin[3 * i] = (lin[3 * i] as number) + px * im;
-    lin[3 * i + 1] = (lin[3 * i + 1] as number) + py * im;
-    lin[3 * i + 2] = (lin[3 * i + 2] as number) + pz * im;
-    const tx = ry * pz - rz * py;
-    const ty = rz * px - rx * pz;
-    const tz = rx * py - ry * px;
-    const e = this.invInertia;
-    const o = 9 * i;
-    const ang = this.ang;
-    ang[3 * i] =
-      (ang[3 * i] as number) +
-      (e[o] as number) * tx +
-      (e[o + 1] as number) * ty +
-      (e[o + 2] as number) * tz;
-    ang[3 * i + 1] =
-      (ang[3 * i + 1] as number) +
-      (e[o + 3] as number) * tx +
-      (e[o + 4] as number) * ty +
-      (e[o + 5] as number) * tz;
-    ang[3 * i + 2] =
-      (ang[3 * i + 2] as number) +
-      (e[o + 6] as number) * tx +
-      (e[o + 7] as number) * ty +
-      (e[o + 8] as number) * tz;
   }
 
   /**
-   * Normal impulses of a multi-point manifold as a linear complementarity problem (see
-   * `solveNormalBlock` in contactSolver.ts); returns false when no active set is consistent.
+   * One sequential-impulse pass over every constraint (normals as a block, then friction).
+   * Constraints whose bodies no other constraint has moved since they last settled are skipped.
+   * `maxChange` is the largest speed change of the pass.
    */
-  private solveBlock(
-    k: number,
-    a: number,
-    b: number,
-    nx: number,
-    ny: number,
-    nz: number,
-    start: number,
-    n: number,
-  ): boolean {
-    const K = this.K;
-    const ko = this.cKStart[k] as number;
-    for (let i = 0; i < n; i++) {
-      let kl = 0;
-      for (let j = 0; j < n; j++)
-        kl += (K[ko + i * n + j] as number) * (this.pImpulse[3 * (start + j)] as number);
-      BQ[i] =
-        this.speedAlong(a, b, start + i, nx, ny, nz) - (this.pTarget[start + i] as number) - kl;
-    }
-    const EPS = 1e-12;
-    for (let mask = (1 << n) - 1; mask >= 0; mask--) {
-      let m = 0;
-      for (let i = 0; i < n; i++) if (mask & (1 << i)) BS[m++] = i;
-      BL.fill(0, 0, n);
-      if (m > 0) {
-        for (let r = 0; r < m; r++) {
-          const si = BS[r] as number;
-          for (let c = 0; c < m; c++)
-            BM[r * (m + 1) + c] = K[ko + si * n + (BS[c] as number)] as number;
-          BM[r * (m + 1) + m] = -(BQ[si] as number);
-        }
-        if (!eliminate(m)) continue;
-        let ok = true;
-        for (let r = 0; r < m; r++) {
-          const v = BM[r * (m + 1) + m] as number;
-          if (v < -EPS) ok = false;
-          BL[BS[r] as number] = Math.max(0, v);
-        }
-        if (!ok) continue;
-      }
-      let feasible = true;
-      for (let i = 0; i < n && feasible; i++) {
-        if (mask & (1 << i)) continue;
-        let w = BQ[i] as number;
-        for (let j = 0; j < n; j++) w += (K[ko + i * n + j] as number) * (BL[j] as number);
-        if (w < -1e-9) feasible = false;
-      }
-      if (!feasible) continue;
-      this.applyBlock(a, b, nx, ny, nz, start, n);
-      return true;
-    }
-    return false;
-  }
+  iterate(): void {
+    const lin = this.lin;
+    const ang = this.ang;
+    const invMass = this.invMass;
+    const J = this.pJ;
+    const pI = this.pImpulse;
+    const pM = this.pMass;
+    const pT = this.pTarget;
+    const cBodyA = this.cBodyA;
+    const cBodyB = this.cBodyB;
+    const cNormal = this.cNormal;
+    const cTan1 = this.cTan1;
+    const cTan2 = this.cTan2;
+    const cPointStart = this.cPointStart;
+    const cPointCount = this.cPointCount;
+    const mod = this.bodyMod;
+    const seen = this.cSeen;
+    const cKValid = this.cKValid;
+    const eps = this.skipTolerance;
+    let maxChange = 0;
+    for (let k = 0; k < this.constraintCount; k++) {
+      const a = cBodyA[k] as number;
+      const b = cBodyB[k] as number;
+      const sig = (mod[a] as number) + (mod[b] as number);
+      if (seen[k] === sig) continue;
+      const imA = invMass[a] as number;
+      const imB = invMass[b] as number;
+      const a3 = 3 * a;
+      const b3 = 3 * b;
+      let lax = lin[a3] as number;
+      let lay = lin[a3 + 1] as number;
+      let laz = lin[a3 + 2] as number;
+      let wax = ang[a3] as number;
+      let way = ang[a3 + 1] as number;
+      let waz = ang[a3 + 2] as number;
+      let lbx = lin[b3] as number;
+      let lby = lin[b3 + 1] as number;
+      let lbz = lin[b3 + 2] as number;
+      let wbx = ang[b3] as number;
+      let wby = ang[b3 + 1] as number;
+      let wbz = ang[b3 + 2] as number;
+      const k3 = 3 * k;
+      const nx = cNormal[k3] as number;
+      const ny = cNormal[k3 + 1] as number;
+      const nz = cNormal[k3 + 2] as number;
+      const start = cPointStart[k] as number;
+      const n = cPointCount[k] as number;
+      const end = start + n;
+      let changed = false;
 
-  /** Applies the block solution in BL as incremental normal impulses. */
-  private applyBlock(
-    a: number,
-    b: number,
-    nx: number,
-    ny: number,
-    nz: number,
-    start: number,
-    n: number,
-  ): void {
-    for (let i = 0; i < n; i++) {
-      const q = start + i;
-      const lam = BL[i] as number;
-      const d = lam - (this.pImpulse[3 * q] as number);
-      this.pImpulse[3 * q] = lam;
-      const mass = this.pMass[3 * q] as number;
-      if (mass > 0) this.track(Math.abs(d) / mass);
-      this.applyPair(a, b, q, nx * d, ny * d, nz * d);
+      // Normal rows. Multi-point manifolds are first tried as one linear complementarity problem.
+      let blocked = false;
+      if (n > 1 && n <= BLOCK_MAX) {
+        const ko = this.cKStart[k] as number;
+        const K = this.K;
+        const base = (lbx - lax) * nx + (lby - lay) * ny + (lbz - laz) * nz;
+        for (let i = 0; i < n; i++) {
+          const q = start + i;
+          const o = 36 * q;
+          // Speed error along the normal; BQ also holds it for the active-set fallback below.
+          BE[i] =
+            base +
+            ((J[o + 3] as number) * wbx + (J[o + 4] as number) * wby + (J[o + 5] as number) * wbz) -
+            ((J[o] as number) * wax + (J[o + 1] as number) * way + (J[o + 2] as number) * waz) -
+            (pT[q] as number);
+        }
+        // Start from the points that carried load last time. When that is all of them:
+        // lambda = lambda_old - K^-1 (speed error), valid when none is negative.
+        let full = 0;
+        for (let i = 0; i < n; i++) if ((pI[3 * (start + i)] as number) > 0) full |= 1 << i;
+        if (full === 0) full = (1 << n) - 1;
+        if (cKValid[k] === 1 && full === (1 << n) - 1) {
+          const Ki = this.Kinv;
+          blocked = true;
+          for (let i = 0; i < n; i++) {
+            let l = pI[3 * (start + i)] as number;
+            for (let j = 0; j < n; j++) l -= (Ki[ko + i * n + j] as number) * (BE[j] as number);
+            if (l < -1e-12) {
+              blocked = false;
+              break;
+            }
+            BL[i] = l > 0 ? l : 0;
+          }
+        }
+        if (!blocked) {
+          for (let i = 0; i < n; i++) {
+            let kl = 0;
+            for (let j = 0; j < n; j++)
+              kl += (K[ko + i * n + j] as number) * (pI[3 * (start + j)] as number);
+            BQ[i] = (BE[i] as number) - kl;
+          }
+          blocked = solveBlock(K, ko, n, full);
+        }
+      }
+      for (let q = start; q < end; q++) {
+        const o = 36 * q;
+        const old = pI[3 * q] as number;
+        let next: number;
+        if (blocked) {
+          next = BL[q - start] as number;
+        } else {
+          const vn =
+            (lbx - lax) * nx +
+            (lby - lay) * ny +
+            (lbz - laz) * nz +
+            ((J[o + 3] as number) * wbx + (J[o + 4] as number) * wby + (J[o + 5] as number) * wbz) -
+            ((J[o] as number) * wax + (J[o + 1] as number) * way + (J[o + 2] as number) * waz);
+          next = old + ((pT[q] as number) - vn) * (pM[3 * q] as number);
+          if (next < 0) next = 0;
+        }
+        const d = next - old;
+        if (d === 0) continue;
+        pI[3 * q] = next;
+        const mass = pM[3 * q] as number;
+        const ad = d < 0 ? -d : d;
+        if (ad > eps * mass) {
+          changed = true;
+          const dv = ad / mass;
+          if (dv > maxChange) maxChange = dv;
+        }
+        lax -= nx * d * imA;
+        lay -= ny * d * imA;
+        laz -= nz * d * imA;
+        lbx += nx * d * imB;
+        lby += ny * d * imB;
+        lbz += nz * d * imB;
+        wax -= (J[o + 6] as number) * d;
+        way -= (J[o + 7] as number) * d;
+        waz -= (J[o + 8] as number) * d;
+        wbx += (J[o + 9] as number) * d;
+        wby += (J[o + 10] as number) * d;
+        wbz += (J[o + 11] as number) * d;
+      }
+
+      // Friction: both tangent speeds are cancelled together, then the 2D impulse is bounded by the
+      // Coulomb cone (norm <= mu N), so friction is isotropic.
+      const mu = this.cFriction[k] as number;
+      const t1x = cTan1[k3] as number;
+      const t1y = cTan1[k3 + 1] as number;
+      const t1z = cTan1[k3 + 2] as number;
+      const t2x = cTan2[k3] as number;
+      const t2y = cTan2[k3 + 1] as number;
+      const t2z = cTan2[k3 + 2] as number;
+      for (let q = start; q < end; q++) {
+        const acc1 = pI[3 * q + 1] as number;
+        const acc2 = pI[3 * q + 2] as number;
+        const maxF = mu * (pI[3 * q] as number);
+        // No normal load and nothing accumulated: the clamped impulse is exactly zero.
+        if (maxF === 0 && acc1 === 0 && acc2 === 0) continue;
+        const m1 = pM[3 * q + 1] as number;
+        const m2 = pM[3 * q + 2] as number;
+        const o1 = 36 * q + 12;
+        const o2 = o1 + 12;
+        const dx = lbx - lax;
+        const dy = lby - lay;
+        const dz = lbz - laz;
+        const v1 =
+          dx * t1x +
+          dy * t1y +
+          dz * t1z +
+          ((J[o1 + 3] as number) * wbx +
+            (J[o1 + 4] as number) * wby +
+            (J[o1 + 5] as number) * wbz) -
+          ((J[o1] as number) * wax + (J[o1 + 1] as number) * way + (J[o1 + 2] as number) * waz);
+        const v2 =
+          dx * t2x +
+          dy * t2y +
+          dz * t2z +
+          ((J[o2 + 3] as number) * wbx +
+            (J[o2 + 4] as number) * wby +
+            (J[o2 + 5] as number) * wbz) -
+          ((J[o2] as number) * wax + (J[o2 + 1] as number) * way + (J[o2 + 2] as number) * waz);
+        let n1 = acc1 - v1 * m1;
+        let n2 = acc2 - v2 * m2;
+        const lenSq = n1 * n1 + n2 * n2;
+        if (lenSq > maxF * maxF) {
+          const sc = maxF / Math.sqrt(lenSq);
+          n1 *= sc;
+          n2 *= sc;
+        }
+        const d1 = n1 - acc1;
+        const d2 = n2 - acc2;
+        if (d1 === 0 && d2 === 0) continue;
+        const ad1 = d1 < 0 ? -d1 : d1;
+        const ad2 = d2 < 0 ? -d2 : d2;
+        if (ad1 > eps * m1 || ad2 > eps * m2) {
+          changed = true;
+          const dv1 = m1 > 0 ? ad1 / m1 : 0;
+          const dv2 = m2 > 0 ? ad2 / m2 : 0;
+          if (dv1 > maxChange) maxChange = dv1;
+          if (dv2 > maxChange) maxChange = dv2;
+        }
+        pI[3 * q + 1] = n1;
+        pI[3 * q + 2] = n2;
+        const px = t1x * d1 + t2x * d2;
+        const py = t1y * d1 + t2y * d2;
+        const pz = t1z * d1 + t2z * d2;
+        lax -= px * imA;
+        lay -= py * imA;
+        laz -= pz * imA;
+        lbx += px * imB;
+        lby += py * imB;
+        lbz += pz * imB;
+        wax -= (J[o1 + 6] as number) * d1 + (J[o2 + 6] as number) * d2;
+        way -= (J[o1 + 7] as number) * d1 + (J[o2 + 7] as number) * d2;
+        waz -= (J[o1 + 8] as number) * d1 + (J[o2 + 8] as number) * d2;
+        wbx += (J[o1 + 9] as number) * d1 + (J[o2 + 9] as number) * d2;
+        wby += (J[o1 + 10] as number) * d1 + (J[o2 + 10] as number) * d2;
+        wbz += (J[o1 + 11] as number) * d1 + (J[o2 + 11] as number) * d2;
+      }
+
+      if (imA > 0) {
+        lin[a3] = lax;
+        lin[a3 + 1] = lay;
+        lin[a3 + 2] = laz;
+        ang[a3] = wax;
+        ang[a3 + 1] = way;
+        ang[a3 + 2] = waz;
+      }
+      if (imB > 0) {
+        lin[b3] = lbx;
+        lin[b3 + 1] = lby;
+        lin[b3 + 2] = lbz;
+        ang[b3] = wbx;
+        ang[b3 + 1] = wby;
+        ang[b3 + 2] = wbz;
+      }
+      if (changed) {
+        seen[k] = -1;
+        if (imA > 0) mod[a] = (mod[a] as number) + 1;
+        if (imB > 0) mod[b] = (mod[b] as number) + 1;
+      } else {
+        seen[k] = sig;
+      }
     }
+    this.maxChange = maxChange;
   }
 
   /** Writes velocities back to the bodies and impulses back to the constraint points. */
@@ -709,49 +721,202 @@ function rot(
   R[off + 2] = v.z + q.w * tz + (q.x * ty - q.y * tx);
 }
 
-/** (r × d) · I (r × d) for a 3x3 row-major I. */
-function invDot(
-  e: ArrayLike<number>,
-  rx: number,
-  ry: number,
-  rz: number,
+/**
+ * Writes one Jacobian row at J[o..o+11]: JA = rA x d, JB = rB x d, IJA = I_A^-1 JA, IJB = I_B^-1 JB
+ * (zero for bodies that do not move), and returns JA . IJA + JB . IJB.
+ */
+function jacobianRow(
+  J: Float64Array,
+  o: number,
+  aSim: boolean,
+  ea: ArrayLike<number>,
+  bSim: boolean,
+  eb: ArrayLike<number>,
+  rax: number,
+  ray: number,
+  raz: number,
+  rbx: number,
+  rby: number,
+  rbz: number,
   dx: number,
   dy: number,
   dz: number,
 ): number {
-  return crossDot(e, rx, ry, rz, rx, ry, rz, dx, dy, dz);
-}
-
-/** (r1 × n) · I (r2 × n) for a 3x3 row-major I. */
-function crossDot(
-  e: ArrayLike<number>,
-  r1x: number,
-  r1y: number,
-  r1z: number,
-  r2x: number,
-  r2y: number,
-  r2z: number,
-  nx: number,
-  ny: number,
-  nz: number,
-): number {
-  const ax = r1y * nz - r1z * ny;
-  const ay = r1z * nx - r1x * nz;
-  const az = r1x * ny - r1y * nx;
-  const bx = r2y * nz - r2z * ny;
-  const by = r2z * nx - r2x * nz;
-  const bz = r2x * ny - r2y * nx;
-  const ix = (e[0] as number) * bx + (e[1] as number) * by + (e[2] as number) * bz;
-  const iy = (e[3] as number) * bx + (e[4] as number) * by + (e[5] as number) * bz;
-  const iz = (e[6] as number) * bx + (e[7] as number) * by + (e[8] as number) * bz;
-  return ax * ix + ay * iy + az * iz;
+  const ax = ray * dz - raz * dy;
+  const ay = raz * dx - rax * dz;
+  const az = rax * dy - ray * dx;
+  const bx = rby * dz - rbz * dy;
+  const by = rbz * dx - rbx * dz;
+  const bz = rbx * dy - rby * dx;
+  J[o] = ax;
+  J[o + 1] = ay;
+  J[o + 2] = az;
+  J[o + 3] = bx;
+  J[o + 4] = by;
+  J[o + 5] = bz;
+  let m = 0;
+  if (aSim) {
+    const ix = (ea[0] as number) * ax + (ea[1] as number) * ay + (ea[2] as number) * az;
+    const iy = (ea[3] as number) * ax + (ea[4] as number) * ay + (ea[5] as number) * az;
+    const iz = (ea[6] as number) * ax + (ea[7] as number) * ay + (ea[8] as number) * az;
+    J[o + 6] = ix;
+    J[o + 7] = iy;
+    J[o + 8] = iz;
+    m += ax * ix + ay * iy + az * iz;
+  } else {
+    J[o + 6] = 0;
+    J[o + 7] = 0;
+    J[o + 8] = 0;
+  }
+  if (bSim) {
+    const ix = (eb[0] as number) * bx + (eb[1] as number) * by + (eb[2] as number) * bz;
+    const iy = (eb[3] as number) * bx + (eb[4] as number) * by + (eb[5] as number) * bz;
+    const iz = (eb[6] as number) * bx + (eb[7] as number) * by + (eb[8] as number) * bz;
+    J[o + 9] = ix;
+    J[o + 10] = iy;
+    J[o + 11] = iz;
+    m += bx * ix + by * iy + bz * iz;
+  } else {
+    J[o + 9] = 0;
+    J[o + 10] = 0;
+    J[o + 11] = 0;
+  }
+  return m;
 }
 
 const BLOCK_MAX = 4;
 const BQ = new Float64Array(BLOCK_MAX);
+const BE = new Float64Array(BLOCK_MAX);
+const BI = new Float64Array(BLOCK_MAX * 2 * BLOCK_MAX);
 const BL = new Float64Array(BLOCK_MAX);
 const BS = new Int32Array(BLOCK_MAX);
 const BM = new Float64Array(BLOCK_MAX * (BLOCK_MAX + 1));
+
+/**
+ * Normal impulses of a multi-point manifold as a linear complementarity problem (see
+ * `solveNormalBlock` in contactSolver.ts). Reads the residual speeds in BQ, writes the new
+ * accumulated impulses to BL; returns false when no active set is consistent.
+ */
+function solveBlock(K: Float64Array, ko: number, n: number, start: number): boolean {
+  const EPS = 1e-12;
+  // K is positive definite, so the solution is unique and any active-set path finds it. Principal
+  // pivoting (drop the most negative impulse, add the most violated point) usually ends in one or
+  // two solves; the exhaustive search below is the fallback if it cycles.
+  let set = start;
+  for (let round = 0; round < 6; round++) {
+    let m = 0;
+    for (let i = 0; i < n; i++) if (set & (1 << i)) BS[m++] = i;
+    BL.fill(0, 0, n);
+    if (m > 0) {
+      for (let r = 0; r < m; r++) {
+        const si = BS[r] as number;
+        for (let c = 0; c < m; c++)
+          BM[r * (m + 1) + c] = K[ko + si * n + (BS[c] as number)] as number;
+        BM[r * (m + 1) + m] = -(BQ[si] as number);
+      }
+      if (!eliminate(m)) break;
+      let worst = -EPS;
+      let drop = -1;
+      for (let r = 0; r < m; r++) {
+        const v = BM[r * (m + 1) + m] as number;
+        if (v < worst) {
+          worst = v;
+          drop = BS[r] as number;
+        }
+        BL[BS[r] as number] = v > 0 ? v : 0;
+      }
+      if (drop >= 0) {
+        set &= ~(1 << drop);
+        continue;
+      }
+    }
+    let add = -1;
+    let low = -1e-9;
+    for (let i = 0; i < n; i++) {
+      if (set & (1 << i)) continue;
+      let w = BQ[i] as number;
+      for (let j = 0; j < n; j++) w += (K[ko + i * n + j] as number) * (BL[j] as number);
+      if (w < low) {
+        low = w;
+        add = i;
+      }
+    }
+    if (add < 0) return true;
+    set |= 1 << add;
+  }
+  for (let mask = (1 << n) - 1; mask >= 0; mask--) {
+    let m = 0;
+    for (let i = 0; i < n; i++) if (mask & (1 << i)) BS[m++] = i;
+    BL.fill(0, 0, n);
+    if (m > 0) {
+      for (let r = 0; r < m; r++) {
+        const si = BS[r] as number;
+        for (let c = 0; c < m; c++)
+          BM[r * (m + 1) + c] = K[ko + si * n + (BS[c] as number)] as number;
+        BM[r * (m + 1) + m] = -(BQ[si] as number);
+      }
+      if (!eliminate(m)) continue;
+      let ok = true;
+      for (let r = 0; r < m; r++) {
+        const v = BM[r * (m + 1) + m] as number;
+        if (v < -EPS) ok = false;
+        BL[BS[r] as number] = v > 0 ? v : 0;
+      }
+      if (!ok) continue;
+    }
+    let feasible = true;
+    for (let i = 0; i < n && feasible; i++) {
+      if (mask & (1 << i)) continue;
+      let w = BQ[i] as number;
+      for (let j = 0; j < n; j++) w += (K[ko + i * n + j] as number) * (BL[j] as number);
+      if (w < -1e-9) feasible = false;
+    }
+    if (!feasible) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Inverts the symmetric n x n block at K[ko..] into out[ko..] (Gauss-Jordan, partial pivoting);
+ * false when it is singular.
+ */
+function invert(K: Float64Array, ko: number, n: number, out: Float64Array): boolean {
+  const w = 2 * n;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      BI[i * w + j] = K[ko + i * n + j] as number;
+      BI[i * w + n + j] = i === j ? 1 : 0;
+    }
+  }
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) {
+      if (Math.abs(BI[r * w + col] as number) > Math.abs(BI[piv * w + col] as number)) piv = r;
+    }
+    const pv = BI[piv * w + col] as number;
+    if (Math.abs(pv) < 1e-14) return false;
+    if (piv !== col) {
+      for (let c = 0; c < w; c++) {
+        const t = BI[col * w + c] as number;
+        BI[col * w + c] = BI[piv * w + c] as number;
+        BI[piv * w + c] = t;
+      }
+    }
+    const inv = 1 / pv;
+    for (let c = 0; c < w; c++) BI[col * w + c] = (BI[col * w + c] as number) * inv;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = BI[r * w + col] as number;
+      if (f === 0) continue;
+      for (let c = 0; c < w; c++)
+        BI[r * w + c] = (BI[r * w + c] as number) - f * (BI[col * w + c] as number);
+    }
+  }
+  for (let i = 0; i < n; i++)
+    for (let j = 0; j < n; j++) out[ko + i * n + j] = BI[i * w + n + j] as number;
+  return true;
+}
 
 /** Gaussian elimination with partial pivoting on the augmented system in BM; false if singular. */
 function eliminate(m: number): boolean {

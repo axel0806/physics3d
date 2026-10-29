@@ -162,3 +162,25 @@ describe('friction ramp', () => {
     }
   }, 600_000);
 });
+
+describe('gyroscopic integration at large dt·|ω|', () => {
+  it('stays bounded for a fast-spinning elongated body (the fixed point alone diverges)', () => {
+    // dt·|ω| is about 4 on a long thin box: the implicit-midpoint fixed-point iteration diverges here,
+    // and used to blow the angular velocity up to the thousands of rad/s (ragdoll heap, 4 mm margin).
+    const w = new World({ gravity: new Vec3(0, 0, 0) });
+    const b = w.createBody({ angularVelocity: new Vec3(200, 140, 100) });
+    w.createCollider(b, new Box(0.6, 0.05, 0.05));
+    const energy = (): number => {
+      const L = spinAngularMomentum(b);
+      return 0.5 * L.dot(b.angularVelocity);
+    };
+    const e0 = energy();
+    const speed0 = b.angularVelocity.length();
+    for (let i = 0; i < 600; i++) {
+      w.step(1 / 60);
+      expect(b.angularVelocity.length()).toBeLessThan(1.5 * speed0);
+    }
+    expect(Number.isFinite(energy())).toBe(true);
+    expect(energy()).toBeLessThan(2 * e0);
+  });
+});

@@ -11,9 +11,11 @@ import {
   integrateVelocities,
 } from '../dynamics/integrate';
 import type { ConvexShape } from '../shapes/shape';
-import { Sphere, Triangle, TriangleMesh } from '../shapes';
+import { Box, Sphere, Triangle, TriangleMesh } from '../shapes';
 import type { Placed } from '../collision/narrowphase';
-import { BroadPhase, pairKey } from '../collision/broadphase';
+import { BroadPhase, pairHi, pairKey, pairLo } from '../collision/broadphase';
+import { BoxPoseCache, boxesSeparated } from '../collision/boxCache';
+import { boxBoxManifoldPooled } from '../collision/narrowphase/sat';
 import { Joint } from '../constraints/joint';
 import { manifoldOf, swapManifold } from '../collision/pairs';
 import { convexTriangleContact } from '../collision/narrowphase/triangleContact';
@@ -731,6 +733,7 @@ export class World {
       if (!body.isSimulated) continue;
       integrateVelocities(body, this.gravity, dt);
       if (body.jointCount === 0) integrateOrientation(body, dt);
+      else body.updateWorldInertia();
     }
     this.lap('integrate');
     for (const j of this.joints) {
@@ -1030,8 +1033,13 @@ export class World {
     }
     // Refresh manifolds for every overlapping pair.
     const wakesBefore = this.pairWakes;
-    for (const [key, pair] of this.currentPairs()) {
-      const [ia, ib] = pair;
+    this.boxPoses.begin();
+    const pairKeys = this.broadphase.sortedPairKeys();
+    const pairCount = this.broadphase.pairKeyCount();
+    for (let pi = 0; pi < pairCount; pi++) {
+      const key = pairKeys[pi] as number;
+      const ia = pairLo(key);
+      const ib = pairHi(key);
       const ca = this.proxyCollider.get(ia);
       const cb = this.proxyCollider.get(ib);
       if (!ca || !cb) continue;
@@ -1039,7 +1047,7 @@ export class World {
         this.skippedPairs.push(key, ia, ib);
         continue;
       }
-      this.refreshPair(key, ca, cb, dt);
+      this.refreshPair(key, ca, cb, dt, ia, ib);
     }
     // A pair of sleepers is judged again once the pass above has woken whatever it touches, so a
     // body woken by a later pair does not miss its contacts for a step.
@@ -1049,8 +1057,9 @@ export class World {
       const key = skipped[i] as number;
       const ca = recheck ? this.proxyCollider.get(skipped[i + 1] as number) : undefined;
       const cb = recheck ? this.proxyCollider.get(skipped[i + 2] as number) : undefined;
-      if (ca && cb && this.shouldCollide(ca, cb)) this.refreshPair(key, ca, cb, dt);
-      else this.dropPair(key);
+      if (ca && cb && this.shouldCollide(ca, cb)) {
+        this.refreshPair(key, ca, cb, dt, skipped[i + 1] as number, skipped[i + 2] as number);
+      } else this.dropPair(key);
     }
     skipped.length = 0;
     this.lap('narrowphase');
@@ -1060,29 +1069,7 @@ export class World {
   private readonly skippedPairs: number[] = [];
   private pairWakes = 0;
 
-  /** Pooled (key, [a, b]) tuples and the view of them returned by `currentPairs`. */
-  private readonly pairPool: [number, [number, number]][] = [];
-  private readonly pairView: [number, [number, number]][] = [];
-
-  private currentPairs(): [number, [number, number]][] {
-    const list = this.broadphase.pairList();
-    const view = this.pairView;
-    view.length = 0;
-    for (let i = 0; i < list.length; i++) {
-      const [a, b] = list[i] as [number, number];
-      let e = this.pairPool[i];
-      if (e) {
-        e[0] = pairKey(a, b);
-        e[1][0] = a;
-        e[1][1] = b;
-      } else {
-        e = [pairKey(a, b), [a, b]];
-        this.pairPool.push(e);
-      }
-      view.push(e);
-    }
-    return view;
-  }
+  private readonly boxPoses = new BoxPoseCache();
 
   private shouldCollide(a: Collider, b: Collider): boolean {
     if (a.body === b.body) return false;
@@ -1174,20 +1161,38 @@ export class World {
     else if (had) this.emit({ kind: 'end', a: ca, b: cb });
   }
 
-  private refreshPair(key: number, ca: Collider, cb: Collider, dt: number): void {
+  private refreshPair(
+    key: number,
+    ca: Collider,
+    cb: Collider,
+    dt: number,
+    ia: number,
+    ib: number,
+  ): void {
     if (ca.shape instanceof TriangleMesh || cb.shape instanceof TriangleMesh) {
       this.refreshMeshPair(key, ca, cb);
       return;
     }
-    ca.body.colliderTransform(ca, S_TA);
-    cb.body.colliderTransform(cb, S_TB);
-    const placedA = S_PLACED_A;
-    const placedB = S_PLACED_B;
-    placedA.shape = ca.shape;
-    placedB.shape = cb.shape;
-    const m =
-      manifoldOf(placedA, placedB, this.contactMargin) ??
-      (this.ccdMode === 'speculative' ? this.speculative(ca, cb, placedA, placedB, dt) : null);
+    let m: ContactManifold | null;
+    if (ca.shape instanceof Box && cb.shape instanceof Box && this.ccdMode !== 'speculative') {
+      // Box pair: poses are built once per body per pass, and pairs whose world AABBs are apart
+      // by more than the margin cannot touch.
+      const pa = this.boxPoses.get(ia, ca);
+      const pb = this.boxPoses.get(ib, cb);
+      m = boxesSeparated(pa, pb, this.contactMargin)
+        ? null
+        : boxBoxManifoldPooled(pa.ob, pb.ob, this.contactMargin);
+    } else {
+      ca.body.colliderTransform(ca, S_TA);
+      cb.body.colliderTransform(cb, S_TB);
+      const placedA = S_PLACED_A;
+      const placedB = S_PLACED_B;
+      placedA.shape = ca.shape;
+      placedB.shape = cb.shape;
+      m =
+        manifoldOf(placedA, placedB, this.contactMargin) ??
+        (this.ccdMode === 'speculative' ? this.speculative(ca, cb, placedA, placedB, dt) : null);
+    }
     const old = this.contacts.get(key);
     if (!m) {
       if (old) {
@@ -1198,10 +1203,12 @@ export class World {
     }
     const c = this.makeConstraint(ca, cb, m, old, 0);
     if (!old) this.emit({ kind: 'begin', a: ca, b: cb });
-    else this.emit({ kind: 'persist', a: ca, b: cb });
+    else if (this.listeners.length > 0) this.emit({ kind: 'persist', a: ca, b: cb });
     // A listener may have destroyed either collider; do not resurrect a contact for it.
-    if (!this.colliderProxy.has(ca) || !this.colliderProxy.has(cb)) return;
-    this.contacts.set(key, c);
+    if (this.listeners.length > 0 && !(this.colliderProxy.has(ca) && this.colliderProxy.has(cb))) {
+      return;
+    }
+    if (c !== old) this.contacts.set(key, c);
     // A new contact wakes an island that touches an awake body. Persisting contacts do not wake
     // anything, so resting stacks can accumulate sleep time.
     if (!old) this.wakeOnNewContact(ca.body, cb.body);
@@ -1240,8 +1247,9 @@ export class World {
         break;
       }
     }
-    const pa = this.colliderProxy.get(ca) as number;
-    const pb = this.colliderProxy.get(cb) as number;
+    // An existing constraint belongs to this very pair, so its proxy ids still hold.
+    const pa = old ? 0 : (this.colliderProxy.get(ca) as number);
+    const pb = old ? 0 : (this.colliderProxy.get(cb) as number);
     const c: Mutable<ContactConstraint> = old ?? {
       bodyA: ca.body,
       bodyB: cb.body,
@@ -1283,7 +1291,6 @@ export class World {
     }
     c.friction = Math.sqrt(ca.friction * cb.friction);
     c.restitution = Math.max(ca.restitution, cb.restitution);
-    if (c.pair[0] !== pa || c.pair[1] !== pb) c.pair = [pa, pb];
     c.sub = sub;
     const pts = c.points;
     for (let i = 0; i < n; i++) {
@@ -1408,14 +1415,18 @@ export class World {
    */
   private updateSleep(contacts: readonly ContactConstraint[], dt: number): void {
     // Union-find over the bodies, with the parent links stored on the bodies themselves.
+    const sl2 = this.sleepLinearSpeed ** 2;
+    const sa2 = this.sleepAngularSpeed ** 2;
     for (const body of this.bodies) {
       body.islandParent = body;
       body.islandMin = Infinity;
       if (!body.isDynamic) continue;
-      const slow =
-        V.lengthSq(body.linearVelocity) < this.sleepLinearSpeed ** 2 &&
-        V.lengthSq(body.angularVelocity) < this.sleepAngularSpeed ** 2;
-      body.sleepTime = slow ? body.sleepTime + dt : 0;
+      // Hysteresis: the rest timer runs below the sleep speeds, holds between them and twice them
+      // (a settling heap twitches across the threshold every few frames), and resets above.
+      const lin = V.lengthSq(body.linearVelocity);
+      const ang = V.lengthSq(body.angularVelocity);
+      if (lin < sl2 && ang < sa2) body.sleepTime += dt;
+      else if (lin >= SLEEP_RESET * sl2 || ang >= SLEEP_RESET * sa2) body.sleepTime = 0;
       body.islandMin = body.sleepTime;
     }
     // A shared static floor or anchor never couples bodies.
@@ -1474,6 +1485,9 @@ export class World {
   }
 }
 
+/** Squared speed ratio above which a body's rest timer resets (twice the sleep speed). */
+const SLEEP_RESET = 4;
+
 function findIsland(b: RigidBody): RigidBody {
   let r = b;
   while (r.islandParent !== r) {
@@ -1512,16 +1526,40 @@ function placedBounds(shape: ColliderShape, t: Transform): AABB {
   return placedBoundsInto(new AABB(), shape, t);
 }
 
-/** `placedBounds` into `out`. Corner order (x slowest, z fastest) matches the allocating version. */
+/**
+ * `placedBounds` into `out`: the box of the local bounds' centre c and half-extents h placed at `t`
+ * is centred at t.p + R c and has half-extents |R| h (the exact extreme of the eight corners).
+ */
 function placedBoundsInto(out: AABB, shape: ColliderShape, t: Transform): AABB {
   const local = shape.localBounds(S_LB);
-  BB.empty(out);
-  for (let i = 0; i < 8; i++) {
-    S_PT2.x = i & 4 ? local.max.x : local.min.x;
-    S_PT2.y = i & 2 ? local.max.y : local.min.y;
-    S_PT2.z = i & 1 ? local.max.z : local.min.z;
-    BB.expandPoint(out, T.apply(S_PT, t, S_PT2));
-  }
+  const cx = 0.5 * (local.min.x + local.max.x);
+  const cy = 0.5 * (local.min.y + local.max.y);
+  const cz = 0.5 * (local.min.z + local.max.z);
+  const hx = 0.5 * (local.max.x - local.min.x);
+  const hy = 0.5 * (local.max.y - local.min.y);
+  const hz = 0.5 * (local.max.z - local.min.z);
+  const { x, y, z, w } = t.q;
+  const r00 = 1 - 2 * (y * y + z * z);
+  const r01 = 2 * (x * y - z * w);
+  const r02 = 2 * (x * z + y * w);
+  const r10 = 2 * (x * y + z * w);
+  const r11 = 1 - 2 * (x * x + z * z);
+  const r12 = 2 * (y * z - x * w);
+  const r20 = 2 * (x * z - y * w);
+  const r21 = 2 * (y * z + x * w);
+  const r22 = 1 - 2 * (x * x + y * y);
+  const px = t.p.x + r00 * cx + r01 * cy + r02 * cz;
+  const py = t.p.y + r10 * cx + r11 * cy + r12 * cz;
+  const pz = t.p.z + r20 * cx + r21 * cy + r22 * cz;
+  const ex = Math.abs(r00) * hx + Math.abs(r01) * hy + Math.abs(r02) * hz;
+  const ey = Math.abs(r10) * hx + Math.abs(r11) * hy + Math.abs(r12) * hz;
+  const ez = Math.abs(r20) * hx + Math.abs(r21) * hy + Math.abs(r22) * hz;
+  out.min.x = px - ex;
+  out.min.y = py - ey;
+  out.min.z = pz - ez;
+  out.max.x = px + ex;
+  out.max.y = py + ey;
+  out.max.z = pz + ez;
   return out;
 }
 

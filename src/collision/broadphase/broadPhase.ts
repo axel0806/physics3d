@@ -8,6 +8,14 @@ export function pairKey(a: number, b: number): number {
   return lo * 0x4000000 + hi;
 }
 
+/** Splits a `pairKey` into its smaller and larger proxy id. */
+export function pairLo(key: number): number {
+  return Math.floor(key / 0x4000000);
+}
+export function pairHi(key: number): number {
+  return key - Math.floor(key / 0x4000000) * 0x4000000;
+}
+
 export interface PairChange {
   readonly kind: 'begin' | 'end';
   /** Smaller proxy id first. */
@@ -81,6 +89,77 @@ export class BroadPhase {
       .sort((x, y) => x[0] - y[0] || x[1] - y[1]);
   }
 
+  private sortedKeys = new Float64Array(1024);
+  private sortedCount = 0;
+  private sortedValid = false;
+
+  /**
+   * Keys (see `pairKey`) of all current pairs in ascending order, which equals (a, b) order.
+   * The returned array is reused: read only the first `pairKeyCount()` entries, before the next change.
+   */
+  sortedPairKeys(): Float64Array {
+    if (!this.sortedValid && this.sortedReady && this.opLog.length <= 48) {
+      this.replayOps();
+    } else if (!this.sortedValid) {
+      const n = this.pairs.size;
+      if (n > this.sortedKeys.length) this.sortedKeys = new Float64Array(2 * n);
+      const keys = this.sortedKeys;
+      let i = 0;
+      for (const k of this.pairs.keys()) keys[i++] = k;
+      keys.subarray(0, n).sort();
+      this.sortedCount = n;
+      this.sortedValid = true;
+      this.sortedReady = true;
+      this.opLog.length = 0;
+    }
+    return this.sortedKeys;
+  }
+
+  /** Pair additions (positive) and removals (negative key) since the sorted array was valid. */
+  private readonly opLog: number[] = [];
+  private sortedReady = false;
+
+  /** Applies the logged pair changes to the sorted array by binary search and shifting. */
+  private replayOps(): void {
+    const log = this.opLog;
+    if (this.sortedCount + log.length > this.sortedKeys.length) {
+      const grown = new Float64Array(2 * (this.sortedCount + log.length));
+      grown.set(this.sortedKeys.subarray(0, this.sortedCount));
+      this.sortedKeys = grown;
+    }
+    const keys = this.sortedKeys;
+    let n = this.sortedCount;
+    for (let i = 0; i < log.length; i++) {
+      const op = log[i] as number;
+      const key = op < 0 ? -op - 1 : op;
+      let lo = 0;
+      let hi = n;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if ((keys[mid] as number) < key) lo = mid + 1;
+        else hi = mid;
+      }
+      const present = lo < n && keys[lo] === key;
+      if (op < 0) {
+        if (present) {
+          keys.copyWithin(lo, lo + 1, n);
+          n--;
+        }
+      } else if (!present) {
+        keys.copyWithin(lo + 1, lo, n);
+        keys[lo] = key;
+        n++;
+      }
+    }
+    this.sortedCount = n;
+    this.sortedValid = true;
+    log.length = 0;
+  }
+
+  pairKeyCount(): number {
+    return this.sortedCount;
+  }
+
   hasPair(a: number, b: number): boolean {
     return this.pairs.has(pairKey(a, b));
   }
@@ -119,6 +198,8 @@ export class BroadPhase {
     const lo = a < b ? a : b;
     const hi = a < b ? b : a;
     this.pairs.set(key, [lo, hi]);
+    this.sortedValid = false;
+    if (this.opLog.length <= 48) this.opLog.push(key);
     this.partners.get(a)?.add(b);
     this.partners.get(b)?.add(a);
     this.changes.push({ kind: 'begin', a: lo, b: hi });
@@ -128,6 +209,8 @@ export class BroadPhase {
     const key = pairKey(a, b);
     if (!this.pairs.has(key)) return;
     this.pairs.delete(key);
+    this.sortedValid = false;
+    if (this.opLog.length <= 48) this.opLog.push(-key - 1);
     this.partners.get(a)?.delete(b);
     this.partners.get(b)?.delete(a);
     this.changes.push({ kind: 'end', a: Math.min(a, b), b: Math.max(a, b) });

@@ -65,9 +65,6 @@ const EDGE_BIAS = 1e-6;
 const TIE_TOLERANCE = 1e-9;
 
 // ---- Scalar SAT state (module-level scratch; the narrowphase is synchronous and not re-entrant) ----
-let sDx = 0;
-let sDy = 0;
-let sDz = 0;
 let sBestScore = Infinity;
 let sBestOverlap = 0;
 let sBestNx = 0;
@@ -78,32 +75,26 @@ let sBestIndex = 0;
 let sEarlyOut = false;
 let sMargin = 0;
 let sSeparated = false;
-let sA: OrientedBox;
-let sB: OrientedBox;
 const KIND_NAMES: readonly SatKind[] = ['faceA', 'faceB', 'edge'];
 
-/** Projection radius of a box on the unit direction (nx, ny, nz). */
-function radius(box: OrientedBox, nx: number, ny: number, nz: number): number {
-  const a0 = box.axes[0];
-  const a1 = box.axes[1];
-  const a2 = box.axes[2];
-  return (
-    box.h[0] * Math.abs(a0.x * nx + a0.y * ny + a0.z * nz) +
-    box.h[1] * Math.abs(a1.x * nx + a1.y * ny + a1.z * nz) +
-    box.h[2] * Math.abs(a2.x * nx + a2.y * ny + a2.z * nz)
-  );
-}
+// Relative rotation |R_ij| = |a_i . b_j| for the current pair, and the center offset in each frame.
+const absR = new Float64Array(9);
+const tA = new Float64Array(3);
+const tB = new Float64Array(3);
+const hA = new Float64Array(3);
+const hB = new Float64Array(3);
 
-function consider(ux: number, uy: number, uz: number, kind: number, index: number): void {
-  const len = Math.sqrt(ux * ux + uy * uy + uz * uz);
-  if (len < 1e-9) return;
-  const s = 1 / len;
-  const nx = ux * s;
-  const ny = uy * s;
-  const nz = uz * s;
-  const dn = sDx * nx + sDy * ny + sDz * nz;
-  const overlap = radius(sA, nx, ny, nz) + radius(sB, nx, ny, nz) - Math.abs(dn);
-  const score = kind === 2 ? overlap + EDGE_BIAS : overlap;
+/** Records an axis if it is the best so far (or flags separation in early-out mode). */
+function offer(
+  score: number,
+  overlap: number,
+  dn: number,
+  nx: number,
+  ny: number,
+  nz: number,
+  kind: number,
+  index: number,
+): void {
   // A score below -margin guarantees the final best axis separates by more than the margin
   // (its overlap <= score < -margin).
   if (sEarlyOut && score < -sMargin) {
@@ -127,33 +118,93 @@ function consider(ux: number, uy: number, uz: number, kind: number, index: numbe
   sBestIndex = index;
 }
 
-/** Runs the 15-axis test into the module state. Returns false when separated (early-out mode). */
+/**
+ * Runs the 15-axis test into the module state. Returns false when separated (early-out mode).
+ * Uses the relative rotation R = A^T B, so each axis costs a handful of multiplications.
+ */
 function runSat(a: OrientedBox, b: OrientedBox, earlyOut: boolean, margin = 0): boolean {
-  sA = a;
-  sB = b;
-  sDx = b.center.x - a.center.x;
-  sDy = b.center.y - a.center.y;
-  sDz = b.center.z - a.center.z;
+  const ax0 = a.axes[0];
+  const ax1 = a.axes[1];
+  const ax2 = a.axes[2];
+  const bx0 = b.axes[0];
+  const bx1 = b.axes[1];
+  const bx2 = b.axes[2];
+  const dx = b.center.x - a.center.x;
+  const dy = b.center.y - a.center.y;
+  const dz = b.center.z - a.center.z;
   sBestScore = Infinity;
   sBestOverlap = 0;
   sEarlyOut = earlyOut;
   sMargin = margin;
   sSeparated = false;
-  for (let i = 0; i < 3; i++) {
-    const v = a.axes[i] as Vec3;
-    consider(v.x, v.y, v.z, 0, i);
-    if (sSeparated) return false;
-  }
-  for (let i = 0; i < 3; i++) {
-    const v = b.axes[i] as Vec3;
-    consider(v.x, v.y, v.z, 1, i);
-    if (sSeparated) return false;
-  }
+  hA[0] = a.h[0];
+  hA[1] = a.h[1];
+  hA[2] = a.h[2];
+  hB[0] = b.h[0];
+  hB[1] = b.h[1];
+  hB[2] = b.h[2];
+  tA[0] = dx * ax0.x + dy * ax0.y + dz * ax0.z;
+  tA[1] = dx * ax1.x + dy * ax1.y + dz * ax1.z;
+  tA[2] = dx * ax2.x + dy * ax2.y + dz * ax2.z;
+  tB[0] = dx * bx0.x + dy * bx0.y + dz * bx0.z;
+  tB[1] = dx * bx1.x + dy * bx1.y + dz * bx1.z;
+  tB[2] = dx * bx2.x + dy * bx2.y + dz * bx2.z;
   for (let i = 0; i < 3; i++) {
     const u = a.axes[i] as Vec3;
+    absR[3 * i] = Math.abs(u.x * bx0.x + u.y * bx0.y + u.z * bx0.z);
+    absR[3 * i + 1] = Math.abs(u.x * bx1.x + u.y * bx1.y + u.z * bx1.z);
+    absR[3 * i + 2] = Math.abs(u.x * bx2.x + u.y * bx2.y + u.z * bx2.z);
+  }
+  // Faces of A.
+  for (let i = 0; i < 3; i++) {
+    const t = tA[i] as number;
+    const overlap =
+      (hA[i] as number) +
+      (hB[0] as number) * (absR[3 * i] as number) +
+      (hB[1] as number) * (absR[3 * i + 1] as number) +
+      (hB[2] as number) * (absR[3 * i + 2] as number) -
+      Math.abs(t);
+    const v = a.axes[i] as Vec3;
+    offer(overlap, overlap, t, v.x, v.y, v.z, 0, i);
+    if (sSeparated) return false;
+  }
+  // Faces of B.
+  for (let j = 0; j < 3; j++) {
+    const t = tB[j] as number;
+    const overlap =
+      (hB[j] as number) +
+      (hA[0] as number) * (absR[j] as number) +
+      (hA[1] as number) * (absR[3 + j] as number) +
+      (hA[2] as number) * (absR[6 + j] as number) -
+      Math.abs(t);
+    const v = b.axes[j] as Vec3;
+    offer(overlap, overlap, t, v.x, v.y, v.z, 1, j);
+    if (sSeparated) return false;
+  }
+  // Edge axes a_i x b_j. The projection radii follow from R: a_i1 . (a_i x b_j) = +-R(i2, j), etc.
+  for (let i = 0; i < 3; i++) {
+    const u = a.axes[i] as Vec3;
+    const i1 = i === 2 ? 0 : i + 1;
+    const i2 = i === 0 ? 2 : i - 1;
     for (let j = 0; j < 3; j++) {
       const v = b.axes[j] as Vec3;
-      consider(u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x, 2, 3 * i + j);
+      const ux = u.y * v.z - u.z * v.y;
+      const uy = u.z * v.x - u.x * v.z;
+      const uz = u.x * v.y - u.y * v.x;
+      const len = Math.sqrt(ux * ux + uy * uy + uz * uz);
+      if (len < 1e-9) continue;
+      const j1 = j === 2 ? 0 : j + 1;
+      const j2 = j === 0 ? 2 : j - 1;
+      const rad =
+        (hA[i1] as number) * (absR[3 * i2 + j] as number) +
+        (hA[i2] as number) * (absR[3 * i1 + j] as number) +
+        (hB[j1] as number) * (absR[3 * i + j2] as number) +
+        (hB[j2] as number) * (absR[3 * i + j1] as number);
+      const s = 1 / len;
+      const dn = (dx * ux + dy * uy + dz * uz) * s;
+      const overlap = rad * s - Math.abs(dn);
+      const score = overlap + EDGE_BIAS;
+      offer(score, overlap, dn, ux * s, uy * s, uz * s, 2, 3 * i + j);
       if (sSeparated) return false;
     }
   }
@@ -233,6 +284,49 @@ function clipScalar(nx: number, ny: number, nz: number, d: number, idBase: numbe
  * depend only on the geometry, so they persist across frames.
  */
 export function boxBoxManifold(a: OrientedBox, b: OrientedBox, margin = 0): ContactManifold | null {
+  return boxBox(a, b, margin, false);
+}
+
+// Reused result of `boxBoxManifoldPooled`.
+interface MutablePoint {
+  position: Vec3;
+  depth: number;
+  id: number;
+  pointA: Vec3;
+  pointB: Vec3;
+}
+const POOL_NORMAL = new Vec3();
+const POOL_POINTS: MutablePoint[] = [];
+for (let i = 0; i < 4; i++) {
+  POOL_POINTS.push({
+    position: new Vec3(),
+    depth: 0,
+    id: 0,
+    pointA: new Vec3(),
+    pointB: new Vec3(),
+  });
+}
+const POOL_LIST: MutablePoint[] = [];
+const POOL_MANIFOLD: ContactManifold = { normal: POOL_NORMAL, points: POOL_LIST };
+
+/**
+ * Same result as `boxBoxManifold`, but face contacts are written into a shared manifold that is
+ * only valid until the next call (no allocation). Edge contacts are returned as fresh objects.
+ */
+export function boxBoxManifoldPooled(
+  a: OrientedBox,
+  b: OrientedBox,
+  margin = 0,
+): ContactManifold | null {
+  return boxBox(a, b, margin, true);
+}
+
+function boxBox(
+  a: OrientedBox,
+  b: OrientedBox,
+  margin: number,
+  pooled: boolean,
+): ContactManifold | null {
   if (!runSat(a, b, true, margin)) return null;
   if (sBestScore === Infinity) throw new Error('SAT: no candidate axes');
   if (sBestOverlap < -margin) return null;
@@ -365,6 +459,21 @@ export function boxBoxManifold(a: OrientedBox, b: OrientedBox, margin = 0): Cont
 
   const reduced = nc > 4;
   const nOut = reduced ? reduceCandidates(nc) : nc;
+  if (pooled) {
+    V.set(POOL_NORMAL, Nx, Ny, Nz);
+    POOL_LIST.length = nOut;
+    for (let i = 0; i < nOut; i++) {
+      const o = (reduced ? (chosen[i] as number) : i) * CS;
+      const pt = POOL_POINTS[i] as MutablePoint;
+      V.set(pt.position, cand[o + 6] as number, cand[o + 7] as number, cand[o + 8] as number);
+      pt.depth = cand[o + 9] as number;
+      pt.id = cand[o + 10] as number;
+      V.set(pt.pointA, cand[o] as number, cand[o + 1] as number, cand[o + 2] as number);
+      V.set(pt.pointB, cand[o + 3] as number, cand[o + 4] as number, cand[o + 5] as number);
+      POOL_LIST[i] = pt;
+    }
+    return POOL_MANIFOLD;
+  }
   const points: ContactPoint[] = new Array<ContactPoint>(nOut);
   for (let i = 0; i < nOut; i++) {
     const o = (reduced ? (chosen[i] as number) : i) * CS;
