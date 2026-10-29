@@ -24,6 +24,32 @@ Modules: `src/math` (vectors, quaternions, matrices, transforms, AABB), `src/sha
 manager), `src/collision/narrowphase` (support mapping, GJK, EPA, analytic paths, SAT, manifolds),
 `src/dynamics` (bodies, integrator), `src/solver` (contact constraints), `src/world` (World API).
 
+## World API, queries and determinism
+
+`World` offers `createBody/createCollider/addJoint` and `destroyBody/destroyCollider/removeJoint`
+(destroying wakes whatever was touching or jointed to the thing and emits `end` events).
+`advance(frameTime)` runs whole `fixedDt` steps from an accumulator (capped at `maxSubSteps`, the
+excess is dropped) and returns alpha for `interpolatedTransform`, which blends each body's pose at
+the start of the last step with its current pose (slerp for orientation).
+
+Queries are built on the same GJK and time-of-impact code as CCD: `shapeCast` is conservative
+advancement against every collider in the swept bounds, `raycast` is a shape cast of a 1e-9 sphere,
+and `overlap` is GJK on the candidates the broadphase returns. Candidates are visited in proxy-id
+order so ties break the same way every run; `QueryFilter` takes a layer `mask` and a predicate. Casts
+stop 1e-7 short of the surface (closest-point directions are only as accurate as eps over the gap).
+A ray that starts inside a shape does not hit it.
+
+Determinism rests on four rules. The engine uses no `Math.random`, clock or other ambient input (a
+test greps the sources). Everything is iterated in arrays or in orders fixed by ids: contacts are
+solved sorted by broadphase pair key, not by creation order, and the broadphase pair list is sorted.
+Floating-point work follows one code path, with no parallelism and no data-dependent algorithm
+changes. And the complete state is capturable: `snapshot()` stores poses, velocities, sleep timers,
+the previous pose, the accumulator, the warm-start impulses of every contact point (by feature id)
+and of every joint, and `restore()` rebuilds the contact cache and re-synchronises the broadphase.
+`stateHash()` hashes the exact bit patterns of that state. The broadphase tree shape and which
+fat-box pairs exist after a restore may differ from the original run, which does not matter:
+contacts exist only for shapes that really overlap, and those are a function of the poses.
+
 ## Design decisions and tradeoffs
 
 **Continuous collision detection.** Bodies with `ccd: true` use one of two modes (`World.ccdMode`).

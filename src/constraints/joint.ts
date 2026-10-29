@@ -292,6 +292,30 @@ export abstract class Joint {
     readonly bodyB: RigidBody,
   ) {}
 
+  /** Accumulated impulses (the warm-start state) of every lock and row, in field order. */
+  saveImpulses(out: number[] = []): number[] {
+    for (const part of Object.values(this)) {
+      if (part instanceof Row) out.push(part.impulse);
+      else if (part instanceof PointLock || part instanceof AngularLock) {
+        out.push(part.impulse.x, part.impulse.y, part.impulse.z);
+      }
+    }
+    return out;
+  }
+
+  /** Restores impulses written by `saveImpulses`. */
+  loadImpulses(data: readonly number[]): void {
+    let i = 0;
+    for (const part of Object.values(this)) {
+      if (part instanceof Row) part.impulse = data[i++] as number;
+      else if (part instanceof PointLock || part instanceof AngularLock) {
+        part.impulse.x = data[i++] as number;
+        part.impulse.y = data[i++] as number;
+        part.impulse.z = data[i++] as number;
+      }
+    }
+  }
+
   get active(): boolean {
     return this.bodyA.isSimulated || this.bodyB.isSimulated;
   }

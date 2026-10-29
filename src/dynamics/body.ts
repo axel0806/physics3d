@@ -65,6 +65,9 @@ export class RigidBody {
   /** Velocities at the start of the step, before gravity and contacts; restitution uses these. */
   readonly stepStartLinear: Vec3 = new Vec3();
   readonly stepStartAngular: Vec3 = new Vec3();
+  /** Pose at the start of the last step, for render interpolation. */
+  readonly prevPosition: Vec3;
+  readonly prevOrientation: Quat;
   /** Number of joints attached; jointed bodies rotate after the constraint solve. */
   jointCount = 0;
   /** Sleep bookkeeping. */
@@ -77,6 +80,8 @@ export class RigidBody {
     this.type = options.type ?? 'dynamic';
     this.position = options.position?.clone() ?? new Vec3();
     this.orientation = options.orientation?.clone() ?? new Quat();
+    this.prevPosition = this.position.clone();
+    this.prevOrientation = this.orientation.clone();
     this.linearVelocity = options.linearVelocity?.clone() ?? new Vec3();
     this.angularVelocity = options.angularVelocity?.clone() ?? new Vec3();
     this.linearDamping = options.linearDamping ?? 0;
@@ -140,6 +145,12 @@ export class RigidBody {
     out.y = this.linearVelocity.y + (w.z * r.x - w.x * r.z);
     out.z = this.linearVelocity.z + (w.x * r.y - w.y * r.x);
     return out;
+  }
+
+  /** Records the pose at the start of a step. */
+  snapshotPose(): void {
+    V.copy(this.prevPosition, this.position);
+    Q.copy(this.prevOrientation, this.orientation);
   }
 
   /** Records the velocities at the start of a step. */

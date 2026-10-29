@@ -36,6 +36,8 @@ export interface ContactConstraint {
   readonly friction: number;
   readonly restitution: number;
   readonly points: SolverPoint[];
+  /** Broadphase proxy ids of the two colliders (A < B). */
+  readonly pair: readonly [number, number];
   /** Normal effective-mass matrix K_ij (coupled across points through rotation). Filled by prepareContact. */
   normalK: number[][];
 }

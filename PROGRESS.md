@@ -71,6 +71,20 @@ of `pnpm test` (default sample sizes) passed 119 tests across 12 files, and `pnp
   test now skips faces with altitude < 1e-3 (limitation 1 below, near-duplicate input points).
 - The Phase 7 acceptance item "no visible stalls in the demo" needs the Phase 10 demo.
 
+## Phase 8 (World API, queries, determinism): implemented, full-size run recorded below
+
+- `World`: destroy body/collider/joint, `advance(frameTime)` + `interpolatedTransform`, `raycast`,
+  `shapeCast`, `overlap` (layer mask and predicate filters), contact begin/persist/end events,
+  `snapshot()` / `restore()` / `stateHash()`. Contacts are now solved in canonical (pair key) order.
+- Tests: `tests/physics/world-api.test.ts` (15: destroy, fixed step, alpha, ray vs analytic sphere on
+  2,000 random rays, filters, shape cast, overlap) and `tests/determinism/determinism.test.ts`
+  (same scene twice in-process, two child processes, one-bit sensitivity, source grep for ambient
+  nondeterminism, snapshot/restore replays every later hash, restore into a rebuilt world).
+- Default test size: 6 scenes x 1,500 steps. Full acceptance size: `DETERMINISM_FULL=1` runs 50 scenes
+  x 10,000 steps, twice in-process and in 4 child processes. Result: see the line below.
+- Event semantics: a contact between a sleeping body and a static body is dropped silently when the
+  island sleeps (no `end` event), and recreated with `begin` on wake.
+
 ## Known limitations (carry-forward)
 
 1. **Near-flat hulls (thickness ratio ≲ 1e-4)**: quickhull can accept a near-duplicate vertex in a

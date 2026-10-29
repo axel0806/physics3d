@@ -11,6 +11,7 @@ import {
   integrateVelocities,
 } from '../dynamics/integrate';
 import type { ConvexShape } from '../shapes/shape';
+import { Sphere } from '../shapes';
 import { BroadPhase, pairKey } from '../collision/broadphase';
 import { Joint } from '../constraints/joint';
 import { manifoldOf } from '../collision/pairs';
@@ -56,6 +57,68 @@ export interface ColliderOptions {
   readonly mask?: number;
 }
 
+/** Which colliders a query may report: `mask` is tested against collider layers. */
+export interface QueryFilter {
+  readonly mask?: number;
+  readonly predicate?: (c: Collider) => boolean;
+}
+
+export interface RayHit {
+  readonly collider: Collider;
+  readonly point: Vec3;
+  /** Surface normal at the hit, facing the ray origin. */
+  readonly normal: Vec3;
+  readonly distance: number;
+}
+
+export interface ShapeCastHit {
+  readonly collider: Collider;
+  /** Fraction of the translation travelled at first contact. */
+  readonly fraction: number;
+  readonly point: Vec3;
+  /** From the swept shape toward the collider. */
+  readonly normal: Vec3;
+}
+
+export interface WorldSnapshot {
+  readonly frame: number;
+  readonly accumulator: number;
+  readonly bodyIds: readonly number[];
+  readonly bodies: Float64Array;
+  readonly contacts: readonly {
+    readonly pair: [number, number];
+    readonly points: readonly { id: number; n: number; t1: number; t2: number }[];
+  }[];
+  readonly joints: readonly (readonly number[])[];
+}
+
+const BODY_STRIDE = 22;
+/**
+ * Separation at which a query cast counts as touching. Closest-point directions are only as
+ * accurate as eps / separation, so the target is not zero: 1e-7 gives normals good to ~1e-8 and
+ * reports distances early by at most 1e-7.
+ */
+const CAST_SKIN = 1e-7;
+/** A point-sized sphere used as the probe for rays. */
+const RAY_PROBE = new Sphere(1e-9);
+
+/** Hash of the exact bit patterns of a list of doubles (two interleaved 32-bit lanes). */
+function hashDoubles(values: readonly number[]): string {
+  const f = new Float64Array(1);
+  const u = new Uint32Array(f.buffer);
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (const v of values) {
+    f[0] = v;
+    for (const w of u) {
+      h1 = Math.imul(h1 ^ w, 0x01000193) >>> 0;
+      h2 = Math.imul(h2 ^ ((w >>> 15) | (w << 17)), 0x85ebca6b) >>> 0;
+      h2 = (h2 ^ (h2 >>> 13)) >>> 0;
+    }
+  }
+  return h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0');
+}
+
 /** Contact event for listeners: begin, persist, or end, per pair of colliders. */
 export interface ContactEvent {
   readonly kind: 'begin' | 'persist' | 'end';
@@ -90,6 +153,10 @@ export class World {
   private readonly proxyCollider = new Map<number, Collider>();
   private readonly jointedPairs = new Set<number>();
   private nextBodyId = 1;
+  /** Fixed-timestep driver state (see `advance`). */
+  fixedDt = 1 / 120;
+  maxSubSteps = 8;
+  private accumulator = 0;
   private readonly listeners: ((e: ContactEvent) => void)[] = [];
 
   constructor(options: WorldOptions = {}) {
@@ -154,15 +221,288 @@ export class World {
     this.listeners.push(listener);
   }
 
+  /**
+   * Contacts in a canonical order (by broadphase pair key), so the solve does not depend on the
+   * order in which contacts were created. Snapshot/restore and replays then match bit for bit.
+   */
+  private orderedContacts(): ContactConstraint[] {
+    return [...this.contacts.entries()].sort((x, y) => x[0] - y[0]).map(([, c]) => c);
+  }
+
   /** Current contact constraints (for inspection and tests). */
   activeContacts(): ContactConstraint[] {
     return [...this.contacts.values()];
   }
 
+  /** Removes a collider: its broadphase proxy and every contact it was part of (with end events). */
+  destroyCollider(c: Collider): void {
+    const proxy = this.colliderProxy.get(c);
+    if (proxy === undefined) return;
+    for (const [key, k] of [...this.contacts.entries()]) {
+      if (k.pair[0] !== proxy && k.pair[1] !== proxy) continue;
+      this.contacts.delete(key);
+      const first = k.pair[0] === proxy;
+      const other = this.proxyCollider.get(first ? k.pair[1] : k.pair[0]);
+      if (other) {
+        other.body.wake();
+        this.emit({ kind: 'end', a: first ? c : other, b: first ? other : c });
+      }
+    }
+    this.broadphase.destroyProxy(proxy);
+    this.broadphase.updatePairs();
+    this.colliderProxy.delete(c);
+    this.proxyCollider.delete(proxy);
+    this.colliders.splice(this.colliders.indexOf(c), 1);
+    c.body.colliders.splice(c.body.colliders.indexOf(c), 1);
+    if (c.body.isDynamic && c.body.colliders.length > 0) c.body.refreshMassProperties();
+  }
+
+  /** Removes a body with its colliders and joints; bodies that touched it or were jointed to it wake. */
+  destroyBody(body: RigidBody): void {
+    const at = this.bodies.indexOf(body);
+    if (at < 0) return;
+    for (const j of [...this.joints]) {
+      if (j.bodyA !== body && j.bodyB !== body) continue;
+      (j.bodyA === body ? j.bodyB : j.bodyA).wake();
+      this.removeJoint(j);
+    }
+    for (const c of [...body.colliders]) this.destroyCollider(c);
+    this.bodies.splice(this.bodies.indexOf(body), 1);
+  }
+
+  removeContactListener(listener: (e: ContactEvent) => void): void {
+    const i = this.listeners.indexOf(listener);
+    if (i >= 0) this.listeners.splice(i, 1);
+  }
+
+  /**
+   * Fixed-timestep driver: adds `frameTime` to an accumulator, runs whole steps of `fixedDt`
+   * (at most `maxSubSteps`; the rest of a long frame is dropped), and returns the interpolation
+   * factor alpha in [0, 1) for rendering between the previous and current pose.
+   */
+  advance(frameTime: number): number {
+    this.accumulator += Math.max(0, frameTime);
+    let steps = 0;
+    while (this.accumulator >= this.fixedDt && steps < this.maxSubSteps) {
+      this.step(this.fixedDt);
+      this.accumulator -= this.fixedDt;
+      steps++;
+    }
+    if (this.accumulator >= this.fixedDt) this.accumulator = 0;
+    return this.accumulator / this.fixedDt;
+  }
+
+  /** Pose of a body blended between the start of the last step and now. */
+  interpolatedTransform(
+    body: RigidBody,
+    alpha: number,
+    out: Transform = new Transform(),
+  ): Transform {
+    V.lerp(out.p, body.prevPosition, body.position, alpha);
+    Q.slerp(out.q, body.prevOrientation, body.orientation, alpha);
+    return out;
+  }
+
+  /** Closest collider hit by the ray, or null. A ray that starts inside a shape does not hit it. */
+  raycast(
+    origin: Vec3,
+    direction: Vec3,
+    maxDistance: number,
+    filter: QueryFilter = {},
+  ): RayHit | null {
+    const len = V.length(direction);
+    if (!(len > 0) || !(maxDistance > 0)) return null;
+    const unit = V.scale(new Vec3(), direction, 1 / len);
+    const cast = this.shapeCast(
+      RAY_PROBE,
+      new Transform(origin.clone()),
+      V.scale(new Vec3(), unit, maxDistance),
+      filter,
+    );
+    if (!cast) return null;
+    return {
+      collider: cast.collider,
+      point: cast.point,
+      normal: V.negate(new Vec3(), cast.normal),
+      distance: cast.fraction * maxDistance,
+    };
+  }
+
+  /**
+   * Sweeps a convex shape along `translation` (rotation fixed) and returns the first collider it
+   * touches. `normal` points from the swept shape toward the collider. Shapes already overlapping
+   * at the start are ignored.
+   */
+  shapeCast(
+    shape: ConvexShape,
+    transform: Transform,
+    translation: Vec3,
+    filter: QueryFilter = {},
+  ): ShapeCastHit | null {
+    const start = placedBounds(shape, transform);
+    const end = placedBounds(
+      shape,
+      new Transform(V.add(new Vec3(), transform.p, translation), transform.q),
+    );
+    const box = BB.union(new AABB(), start, end);
+    let best: ShapeCastHit | null = null;
+    for (const c of this.candidates(box, filter)) {
+      const toi = timeOfImpact(
+        { shape, transform },
+        { shape: c.shape, transform: c.body.colliderTransform(c, new Transform()) },
+        translation,
+        new Vec3(),
+        { target: CAST_SKIN, tolerance: 0.1 * CAST_SKIN, maxIterations: 200 },
+      );
+      if (toi && (!best || toi.t < best.fraction)) {
+        best = { collider: c, fraction: toi.t, point: toi.pointB, normal: toi.normal };
+      }
+    }
+    return best;
+  }
+
+  /** Colliders whose shape overlaps (or touches) the given shape, in broadphase proxy order. */
+  overlap(shape: ConvexShape, transform: Transform, filter: QueryFilter = {}): Collider[] {
+    const out: Collider[] = [];
+    for (const c of this.candidates(placedBounds(shape, transform), filter)) {
+      const hit = gjk(
+        { shape, transform },
+        { shape: c.shape, transform: c.body.colliderTransform(c, new Transform()) },
+      );
+      if (hit.overlap) out.push(c);
+    }
+    return out;
+  }
+
+  private candidates(box: AABB, filter: QueryFilter): Collider[] {
+    const out: Collider[] = [];
+    for (const proxy of this.broadphase.query(box).sort((a, b) => a - b)) {
+      const c = this.proxyCollider.get(proxy);
+      if (!c) continue;
+      if (filter.mask !== undefined && (filter.mask & c.layer) === 0) continue;
+      if (filter.predicate && !filter.predicate(c)) continue;
+      out.push(c);
+    }
+    return out;
+  }
+
+  /** Copies the complete simulation state (poses, velocities, sleep, warm-start impulses). */
+  snapshot(): WorldSnapshot {
+    const bodies = new Float64Array(this.bodies.length * BODY_STRIDE);
+    this.bodies.forEach((b, i) => {
+      const p = b.position;
+      const q = b.orientation;
+      const v = b.linearVelocity;
+      const w = b.angularVelocity;
+      const pp = b.prevPosition;
+      const pq = b.prevOrientation;
+      // prettier-ignore
+      bodies.set([
+        p.x, p.y, p.z, q.x, q.y, q.z, q.w, v.x, v.y, v.z, w.x, w.y, w.z,
+        b.sleepTime, b.awake ? 1 : 0, pp.x, pp.y, pp.z, pq.x, pq.y, pq.z, pq.w,
+      ], i * BODY_STRIDE);
+    });
+    return {
+      frame: this.frame,
+      accumulator: this.accumulator,
+      bodyIds: this.bodies.map((b) => b.id),
+      bodies,
+      contacts: this.orderedContacts().map((c) => ({
+        pair: [c.pair[0], c.pair[1]] as [number, number],
+        points: c.points.map((p) => ({
+          id: p.id,
+          n: p.impulseN,
+          t1: p.impulseT1,
+          t2: p.impulseT2,
+        })),
+      })),
+      joints: this.joints.map((j) => j.saveImpulses()),
+    };
+  }
+
+  /** Restores a snapshot taken from this world (same bodies, colliders and joints). */
+  restore(snap: WorldSnapshot): void {
+    if (
+      snap.bodyIds.length !== this.bodies.length ||
+      snap.joints.length !== this.joints.length ||
+      snap.bodyIds.some((id, i) => this.bodies[i]?.id !== id)
+    ) {
+      throw new Error('snapshot does not match this world (bodies or joints differ)');
+    }
+    this.bodies.forEach((b, i) => {
+      const d = snap.bodies.subarray(i * BODY_STRIDE, (i + 1) * BODY_STRIDE);
+      V.set(b.position, d[0] as number, d[1] as number, d[2] as number);
+      Q.set(b.orientation, d[3] as number, d[4] as number, d[5] as number, d[6] as number);
+      V.set(b.linearVelocity, d[7] as number, d[8] as number, d[9] as number);
+      V.set(b.angularVelocity, d[10] as number, d[11] as number, d[12] as number);
+      b.sleepTime = d[13] as number;
+      b.awake = d[14] === 1;
+      V.set(b.prevPosition, d[15] as number, d[16] as number, d[17] as number);
+      Q.set(b.prevOrientation, d[18] as number, d[19] as number, d[20] as number, d[21] as number);
+      b.updateWorldInertia();
+    });
+    this.frame = snap.frame;
+    this.accumulator = snap.accumulator;
+    snap.joints.forEach((data, i) => (this.joints[i] as Joint).loadImpulses(data));
+    for (const c of this.colliders) {
+      this.broadphase.moveProxy(this.colliderProxy.get(c) as number, this.worldBounds(c));
+    }
+    this.broadphase.updatePairs();
+    this.contacts.clear();
+    for (const sc of snap.contacts) {
+      const ca = this.proxyCollider.get(sc.pair[0]);
+      const cb = this.proxyCollider.get(sc.pair[1]);
+      if (!ca || !cb) continue;
+      const zero = () => new Vec3();
+      this.contacts.set(pairKey(sc.pair[0], sc.pair[1]), {
+        bodyA: ca.body,
+        bodyB: cb.body,
+        normal: zero(),
+        tangent1: zero(),
+        tangent2: zero(),
+        friction: 0,
+        restitution: 0,
+        pair: sc.pair,
+        normalK: [],
+        points: sc.points.map((p) => ({
+          id: p.id,
+          localA: zero(),
+          localB: zero(),
+          rA: zero(),
+          rB: zero(),
+          gap: 0,
+          restitutionTarget: 0,
+          normalMass: 0,
+          tangentMass1: 0,
+          tangentMass2: 0,
+          impulseN: p.n,
+          impulseT1: p.t1,
+          impulseT2: p.t2,
+        })),
+      });
+    }
+  }
+
+  /** 16-hex-digit hash of the complete simulation state; equal states hash equal, bit for bit. */
+  stateHash(): string {
+    const snap = this.snapshot();
+    const words: number[] = [snap.frame];
+    for (const v of snap.bodies) words.push(v);
+    for (const c of snap.contacts) {
+      words.push(c.pair[0], c.pair[1]);
+      for (const p of c.points) words.push(p.id, p.n, p.t1, p.t2);
+    }
+    for (const j of snap.joints) for (const v of j) words.push(v);
+    return hashDoubles(words);
+  }
+
   /** Advances the simulation by dt seconds. */
   step(dt: number): void {
     if (!(dt > 0)) throw new RangeError('dt must be positive');
-    for (const body of this.bodies) body.snapshotVelocities();
+    for (const body of this.bodies) {
+      body.snapshotPose();
+      body.snapshotVelocities();
+    }
     this.updateBroadphase(dt);
     this.updateContacts(dt);
     for (const j of this.joints) {
@@ -181,7 +521,8 @@ export class World {
       j.prepare(dt);
       j.warmStart();
     }
-    for (const c of this.contacts.values()) {
+    const ordered = this.orderedContacts();
+    for (const c of ordered) {
       if (!this.constraintActive(c)) continue;
       prepareContact(c, this.restitutionThreshold, dt);
       buildNormalK(c);
@@ -189,7 +530,7 @@ export class World {
     }
     for (let it = 0; it < this.velocityIterations; it++) {
       for (const j of this.joints) if (j.active) j.solveVelocity(dt);
-      for (const c of this.contacts.values()) if (this.constraintActive(c)) solveVelocity(c);
+      for (const c of ordered) if (this.constraintActive(c)) solveVelocity(c);
     }
     // Jointed bodies rotate after the solve, from the same pose the joints were evaluated at;
     // free bodies were rotated before it (see integrateOrientation).
@@ -204,7 +545,7 @@ export class World {
     }
     const feedback = new Map<RigidBody, [Vec3, Vec3]>();
     for (let it = 0; it < this.positionIterations; it++) {
-      for (const c of this.contacts.values()) {
+      for (const c of ordered) {
         if (this.constraintActive(c)) solvePosition(c, this.baumgarte, this.linearSlop);
       }
       for (const j of this.joints) if (j.active) j.solveLimits();
@@ -365,17 +706,7 @@ export class World {
   }
 
   private worldBounds(c: Collider): AABB {
-    const t = c.body.colliderTransform(c, new Transform());
-    const local = c.shape.localBounds(new AABB());
-    const out = BB.empty(new AABB());
-    for (const x of [local.min.x, local.max.x]) {
-      for (const y of [local.min.y, local.max.y]) {
-        for (const z of [local.min.z, local.max.z]) {
-          BB.expandPoint(out, T.apply(new Vec3(), t, new Vec3(x, y, z)));
-        }
-      }
-    }
-    return out;
+    return placedBounds(c.shape, c.body.colliderTransform(c, new Transform()));
   }
 
   private updateBroadphase(dt: number): void {
@@ -474,6 +805,7 @@ export class World {
       friction: Math.sqrt(ca.friction * cb.friction),
       restitution: Math.max(ca.restitution, cb.restitution),
       points,
+      pair: [this.colliderProxy.get(ca) as number, this.colliderProxy.get(cb) as number],
       normalK: [],
     };
     if (!old) this.emit({ kind: 'begin', a: ca, b: cb });
@@ -563,6 +895,20 @@ export class World {
       }
     }
   }
+}
+
+/** World-space bounding box of a convex shape placed at `t`. */
+function placedBounds(shape: ConvexShape, t: Transform): AABB {
+  const local = shape.localBounds(new AABB());
+  const out = BB.empty(new AABB());
+  for (const x of [local.min.x, local.max.x]) {
+    for (const y of [local.min.y, local.max.y]) {
+      for (const z of [local.min.z, local.max.z]) {
+        BB.expandPoint(out, T.apply(new Vec3(), t, new Vec3(x, y, z)));
+      }
+    }
+  }
+  return out;
 }
 
 function bodyPairKey(a: RigidBody, b: RigidBody): number {
