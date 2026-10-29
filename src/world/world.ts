@@ -28,7 +28,6 @@ import {
   prepareContact,
   solvePosition,
   solveVelocity,
-  tangentBasis,
   warmStart,
   type ContactConstraint,
   type SolverPoint,
@@ -106,6 +105,59 @@ const CAST_SKIN = 1e-7;
 /** A point-sized sphere used as the probe for rays. */
 const RAY_PROBE = new Sphere(1e-9);
 
+// Step-loop temporaries (PLAN rule 8: hot paths do not allocate). The engine is single-threaded and
+// none of these is live across a call that could reuse it.
+const S_PA = new Vec3();
+const S_PB = new Vec3();
+const S_QA = new Quat();
+const S_QB = new Quat();
+const S_DELTA = new Vec3();
+const S_DQ = new Quat();
+const S_DQI = new Quat();
+const S_AXIS = new Vec3();
+const S_DV = new Vec3();
+const S_OT1 = new Vec3();
+const S_OT2 = new Vec3();
+const S_BOX = new AABB();
+const S_WB = new AABB();
+const S_TC = new Transform();
+const S_TA = new Transform();
+const S_TB = new Transform();
+const S_TM = new Transform();
+const S_PT = new Vec3();
+const S_PT2 = new Vec3();
+const S_SPEC = new Vec3();
+const S_LB = new AABB();
+const S_PLACED_A: { shape: ConvexShape; transform: Transform } = {
+  shape: RAY_PROBE,
+  transform: S_TA,
+};
+const S_PLACED_B: { shape: ConvexShape; transform: Transform } = {
+  shape: RAY_PROBE,
+  transform: S_TB,
+};
+const S_MESH_PTS: [Vec3, Vec3, Vec3] = [new Vec3(), new Vec3(), new Vec3()];
+const S_E1 = new Vec3();
+const S_E2 = new Vec3();
+const S_NTRI = new Vec3();
+const S_W0 = new Vec3();
+const S_W1 = new Vec3();
+const S_W2 = new Vec3();
+/** Previous impulses of a constraint's points, indexed like the new points (see `makeConstraint`). */
+let prevN = new Float64Array(16);
+let prevT1 = new Float64Array(16);
+let prevT2 = new Float64Array(16);
+/** Mutable view of a constraint, for reusing last step's object in place. */
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
+interface ContactEntry {
+  key: number;
+  c: ContactConstraint;
+}
+function compareEntries(x: ContactEntry, y: ContactEntry): number {
+  return x.key - y.key || x.c.sub - y.c.sub;
+}
+
 /** Hash of the exact bit patterns of a list of doubles (two interleaved 32-bit lanes). */
 function hashDoubles(values: readonly number[]): string {
   const f = new Float64Array(1);
@@ -168,7 +220,8 @@ export class World {
   fixedDt = 1 / 120;
   maxSubSteps = 8;
   private accumulator = 0;
-  private readonly listeners: ((e: ContactEvent) => void)[] = [];
+  /** Copy-on-write: `emit` iterates the array it started with, so listeners may (un)subscribe freely. */
+  private listeners: readonly ((e: ContactEvent) => void)[] = [];
 
   constructor(options: WorldOptions = {}) {
     this.gravity = options.gravity?.clone() ?? new Vec3(0, -9.81, 0);
@@ -246,8 +299,10 @@ export class World {
     }
   }
 
-  onContact(listener: (e: ContactEvent) => void): void {
-    this.listeners.push(listener);
+  /** Subscribes to contact events. Returns a function that unsubscribes the listener again. */
+  onContact(listener: (e: ContactEvent) => void): () => void {
+    this.listeners = [...this.listeners, listener];
+    return () => this.removeContactListener(listener);
   }
 
   /**
@@ -255,21 +310,49 @@ export class World {
    * order in which contacts were created. Snapshot/restore and replays then match bit for bit.
    */
   private orderedContacts(): ContactConstraint[] {
-    const all: { key: number; c: ContactConstraint }[] = [];
-    for (const [key, c] of this.contacts) all.push({ key, c });
-    for (const [key, subs] of this.meshContacts)
-      for (const c of subs.values()) all.push({ key, c });
-    return all.sort((x, y) => x.key - y.key || x.c.sub - y.c.sub).map((e) => e.c);
+    const entries = this.orderEntries;
+    entries.length = 0;
+    this.contacts.forEach(this.collectPlain);
+    if (this.meshContacts.size > 0) this.meshContacts.forEach(this.collectMeshGroup);
+    entries.sort(compareEntries);
+    const out = this.orderOut;
+    out.length = entries.length;
+    for (let i = 0; i < entries.length; i++) out[i] = (entries[i] as ContactEntry).c;
+    return out;
   }
 
-  private forEachContact(fn: (c: ContactConstraint) => void): void {
-    for (const c of this.contacts.values()) fn(c);
-    for (const subs of this.meshContacts.values()) for (const c of subs.values()) fn(c);
+  /** Scratch for `orderedContacts`: pooled sort entries, the entry list, and the shared result. */
+  private readonly entryPool: ContactEntry[] = [];
+  private readonly orderEntries: ContactEntry[] = [];
+  private readonly orderOut: ContactConstraint[] = [];
+  private collectKey = 0;
+  /** Pairs that emitted `begin` and not yet `end`, for `restore`. */
+  private readonly begun = new Map<number, { a: Collider; b: Collider }>();
+
+  private pushEntry(key: number, c: ContactConstraint): void {
+    const entries = this.orderEntries;
+    let e = this.entryPool[entries.length];
+    if (e) {
+      e.key = key;
+      e.c = c;
+    } else {
+      e = { key, c };
+      this.entryPool.push(e);
+    }
+    entries.push(e);
   }
+  private readonly collectPlain = (c: ContactConstraint, key: number): void =>
+    this.pushEntry(key, c);
+  private readonly collectMeshSub = (c: ContactConstraint): void =>
+    this.pushEntry(this.collectKey, c);
+  private readonly collectMeshGroup = (subs: Map<number, ContactConstraint>, key: number): void => {
+    this.collectKey = key;
+    subs.forEach(this.collectMeshSub);
+  };
 
   /** Current contact constraints (for inspection and tests). */
   activeContacts(): ContactConstraint[] {
-    return this.orderedContacts();
+    return this.orderedContacts().slice();
   }
 
   /** Removes a collider: its broadphase proxy and every contact it was part of (with end events). */
@@ -327,7 +410,10 @@ export class World {
 
   removeContactListener(listener: (e: ContactEvent) => void): void {
     const i = this.listeners.indexOf(listener);
-    if (i >= 0) this.listeners.splice(i, 1);
+    if (i < 0) return;
+    const next = this.listeners.slice();
+    next.splice(i, 1);
+    this.listeners = next;
   }
 
   /**
@@ -567,6 +653,13 @@ export class World {
         })),
       });
     }
+    // Pairs that began and never ended (including sleeping ones, whose contacts were dropped
+    // silently) but are not in the snapshot have ended.
+    const gone: { a: Collider; b: Collider; key: number }[] = [];
+    for (const [key, pr] of this.begun) {
+      if (!this.contacts.has(key) && !this.meshContacts.has(key)) gone.push({ ...pr, key });
+    }
+    for (const g of gone) if (this.begun.has(g.key)) this.emit({ kind: 'end', a: g.a, b: g.b });
   }
 
   /** 16-hex-digit hash of the complete simulation state; equal states hash equal, bit for bit. */
@@ -671,7 +764,8 @@ export class World {
       else integratePosition(body, dt);
     }
     this.lap('integrate');
-    const feedback = new Map<RigidBody, [Vec3, Vec3]>();
+    const stamp = ++this.stepStamp;
+    this.feedbackBodies.length = 0;
     for (let it = 0; it < this.positionIterations; it++) {
       if (it < this.contactPositionIterations) {
         for (const c of ordered) {
@@ -679,12 +773,12 @@ export class World {
         }
       }
       for (const j of this.joints) if (j.active) j.solveLimits();
-      for (const j of this.joints) if (j.active) this.correctJoint(j, feedback);
+      for (const j of this.joints) if (j.active) this.correctJoint(j, stamp);
     }
-    this.applyFeedback(feedback, dt);
+    this.applyFeedback(ordered, stamp, dt);
     this.lap('solve');
     for (const body of this.bodies) if (body.isSimulated) body.updateWorldInertia();
-    this.updateSleep(dt);
+    this.updateSleep(ordered, dt);
     this.lap('integrate');
     this.frame++;
   }
@@ -695,8 +789,8 @@ export class World {
     const w = body.angularVelocity;
     const len = V.length(w);
     if (len > 0) {
-      const dq = Q.fromAxisAngle(new Quat(), V.scale(new Vec3(), w, 1 / len), len * dt);
-      Q.mul(body.orientation, dq, body.orientation);
+      Q.fromAxisAngle(S_DQ, V.scale(S_AXIS, w, 1 / len), len * dt);
+      Q.mul(body.orientation, S_DQ, body.orientation);
       Q.normalize(body.orientation, body.orientation);
     }
   }
@@ -706,7 +800,7 @@ export class World {
     if (!body.isSimulated) return false;
     const travel = V.length(body.linearVelocity) * dt;
     let core = Infinity;
-    const box = new AABB();
+    const box = S_BOX;
     for (const c of body.colliders) {
       c.shape.localBounds(box);
       core = Math.min(core, box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z);
@@ -795,58 +889,65 @@ export class World {
    * step dissipates energy at first order in dt. The total is capped per body so a badly violated
    * joint is pulled in gently rather than kicked.
    */
-  private correctJoint(j: Joint, feedback: Map<RigidBody, [Vec3, Vec3]>): void {
+  private correctJoint(j: Joint, stamp: number): void {
     const a = j.bodyA;
     const b = j.bodyB;
-    const pa = V.copy(new Vec3(), a.position);
-    const pb = V.copy(new Vec3(), b.position);
-    const qa = a.orientation.clone();
-    const qb = b.orientation.clone();
+    V.copy(S_PA, a.position);
+    V.copy(S_PB, b.position);
+    Q.copy(S_QA, a.orientation);
+    Q.copy(S_QB, b.orientation);
     j.solvePosition();
-    this.accumulate(a, pa, qa, feedback);
-    this.accumulate(b, pb, qb, feedback);
+    this.accumulate(a, S_PA, S_QA, stamp);
+    this.accumulate(b, S_PB, S_QB, stamp);
   }
 
-  private accumulate(
-    body: RigidBody,
-    p0: Vec3,
-    q0: Quat,
-    feedback: Map<RigidBody, [Vec3, Vec3]>,
-  ): void {
+  /** Step counter that stamps per-body scratch (joint feedback, contact-touch marks). */
+  private stepStamp = 0;
+  /** Bodies with joint feedback this step, in first-touch order. */
+  private readonly feedbackBodies: RigidBody[] = [];
+
+  private accumulate(body: RigidBody, p0: Vec3, q0: Quat, stamp: number): void {
     if (!body.isSimulated) return;
-    let acc = feedback.get(body);
-    if (!acc) {
-      acc = [new Vec3(), new Vec3()];
-      feedback.set(body, acc);
+    if (body.feedbackStamp !== stamp) {
+      body.feedbackStamp = stamp;
+      V.set(body.feedbackLinear, 0, 0, 0);
+      V.set(body.feedbackAngular, 0, 0, 0);
+      this.feedbackBodies.push(body);
     }
-    V.add(acc[0], acc[0], V.sub(new Vec3(), body.position, p0));
+    V.add(body.feedbackLinear, body.feedbackLinear, V.sub(S_DELTA, body.position, p0));
     // World-frame rotation vector taking q0 to the current orientation.
-    const dq = Q.mul(new Quat(), body.orientation, Q.invert(new Quat(), q0));
+    const dq = Q.mul(S_DQ, body.orientation, Q.invert(S_DQI, q0));
     const k = dq.w < 0 ? -2 : 2;
-    V.add(acc[1], acc[1], new Vec3(dq.x * k, dq.y * k, dq.z * k));
+    const acc = body.feedbackAngular;
+    acc.x = acc.x + dq.x * k;
+    acc.y = acc.y + dq.y * k;
+    acc.z = acc.z + dq.z * k;
   }
 
-  private applyFeedback(feedback: Map<RigidBody, [Vec3, Vec3]>, dt: number): void {
+  private applyFeedback(contacts: readonly ContactConstraint[], stamp: number, dt: number): void {
+    const bodies = this.feedbackBodies;
+    if (bodies.length === 0) return;
     // Bodies in contact are skipped: there the joint displacement is tangled with contact pushes,
     // and feeding it back pumps energy into limbs lying on surfaces (measured: 16 m/s forearm
     // whips on a staircase). Free-flying jointed bodies are where the dissipation matters.
-    const touching = new Set<RigidBody>();
-    this.forEachContact((c) => {
-      touching.add(c.bodyA);
-      touching.add(c.bodyB);
-    });
-    for (const [body, [dx, dtheta]] of feedback) {
-      if (touching.has(body)) continue;
-      for (const [target, delta] of [
-        [body.linearVelocity, dx],
-        [body.angularVelocity, dtheta],
-      ] as const) {
-        const dv = V.scale(new Vec3(), delta, 1 / dt);
-        const len = V.length(dv);
-        if (len > this.maxCorrectionSpeed) V.scale(dv, dv, this.maxCorrectionSpeed / len);
-        V.add(target, target, dv);
-      }
+    for (let i = 0; i < contacts.length; i++) {
+      const c = contacts[i] as ContactConstraint;
+      c.bodyA.touchStamp = stamp;
+      c.bodyB.touchStamp = stamp;
     }
+    for (let i = 0; i < bodies.length; i++) {
+      const body = bodies[i] as RigidBody;
+      if (body.touchStamp === stamp) continue;
+      this.feedbackInto(body.linearVelocity, body.feedbackLinear, dt);
+      this.feedbackInto(body.angularVelocity, body.feedbackAngular, dt);
+    }
+  }
+
+  private feedbackInto(target: Vec3, delta: Vec3, dt: number): void {
+    const dv = V.scale(S_DV, delta, 1 / dt);
+    const len = V.length(dv);
+    if (len > this.maxCorrectionSpeed) V.scale(dv, dv, this.maxCorrectionSpeed / len);
+    V.add(target, target, dv);
   }
 
   private constraintActive(c: ContactConstraint): boolean {
@@ -862,18 +963,24 @@ export class World {
     return placedBounds(c.shape, c.body.colliderTransform(c, new Transform()));
   }
 
+  /** `worldBounds` into the shared scratch box (valid until the next call). */
+  private worldBoundsScratch(c: Collider): AABB {
+    return placedBoundsInto(S_WB, c.shape, c.body.colliderTransform(c, S_TC));
+  }
+
   private updateBroadphase(dt: number): void {
     for (const c of this.colliders) {
       // Static and sleeping bodies do not move; their proxies stay as they are.
       if (!c.body.isSimulated && c.body.type !== 'kinematic') continue;
       const proxy = this.colliderProxy.get(c);
       if (proxy === undefined) continue;
-      const box = this.worldBounds(c);
+      const box = this.worldBoundsScratch(c);
       const v = c.body.linearVelocity;
       if (c.body.ccd && this.ccdMode === 'speculative' && c.body.isSimulated) {
         // Speculative contacts need pairs for everything within this step's reach.
-        BB.expandPoint(box, V.add(new Vec3(), box.min, new Vec3(v.x * dt, v.y * dt, v.z * dt)));
-        BB.expandPoint(box, V.add(new Vec3(), box.max, new Vec3(v.x * dt, v.y * dt, v.z * dt)));
+        V.set(S_SPEC, v.x * dt, v.y * dt, v.z * dt);
+        BB.expandPoint(box, V.add(S_PT, box.min, S_SPEC));
+        BB.expandPoint(box, V.add(S_PT, box.max, S_SPEC));
       }
       this.broadphase.moveProxy(proxy, box, v.x * dt, v.y * dt, v.z * dt);
     }
@@ -925,8 +1032,28 @@ export class World {
   private readonly skippedPairs: number[] = [];
   private pairWakes = 0;
 
+  /** Pooled (key, [a, b]) tuples and the view of them returned by `currentPairs`. */
+  private readonly pairPool: [number, [number, number]][] = [];
+  private readonly pairView: [number, [number, number]][] = [];
+
   private currentPairs(): [number, [number, number]][] {
-    return this.broadphase.pairList().map(([a, b]) => [pairKey(a, b), [a, b]]);
+    const list = this.broadphase.pairList();
+    const view = this.pairView;
+    view.length = 0;
+    for (let i = 0; i < list.length; i++) {
+      const [a, b] = list[i] as [number, number];
+      let e = this.pairPool[i];
+      if (e) {
+        e[0] = pairKey(a, b);
+        e[1][0] = a;
+        e[1][1] = b;
+      } else {
+        e = [pairKey(a, b), [a, b]];
+        this.pairPool.push(e);
+      }
+      view.push(e);
+    }
+    return view;
   }
 
   private shouldCollide(a: Collider, b: Collider): boolean {
@@ -946,37 +1073,44 @@ export class World {
   }
 
   /** Contacts between a static triangle mesh and a convex collider: one constraint per triangle. */
+  /** Scratch for `refreshMeshPair`: triangle indices and the map being built for the pair. */
+  private readonly meshTris: number[] = [];
+  private meshScratch = new Map<number, ContactConstraint>();
+
   private refreshMeshPair(key: number, ca: Collider, cb: Collider): void {
     const meshIsA = ca.shape instanceof TriangleMesh;
     const cm = meshIsA ? ca : cb;
     const co = meshIsA ? cb : ca;
     const mesh = cm.shape as TriangleMesh;
     if (co.shape instanceof TriangleMesh) return;
-    const tm = cm.body.colliderTransform(cm, new Transform());
-    const to = co.body.colliderTransform(co, new Transform());
-    const tris: number[] = [];
-    mesh.bvh.query(toLocalBox(placedBounds(co.shape, to), tm), tris);
-    tris.sort((x, y) => x - y);
+    const tm = cm.body.colliderTransform(cm, S_TM);
+    const to = co.body.colliderTransform(co, S_TA);
+    const tris = this.meshTris;
+    tris.length = 0;
+    mesh.bvh.query(toLocalBoxInto(S_BOX, placedBoundsInto(S_WB, co.shape, to), tm), tris);
+    tris.sort(ascending);
     const subs = this.meshContacts.get(key);
-    const next = new Map<number, ContactConstraint>();
-    const pts: [Vec3, Vec3, Vec3] = [new Vec3(), new Vec3(), new Vec3()];
-    const nTri = new Vec3();
-    for (const tri of tris) {
+    const next = this.meshScratch;
+    const pts = S_MESH_PTS;
+    const nTri = S_NTRI;
+    for (let ti = 0; ti < tris.length; ti++) {
+      const tri = tris[ti] as number;
       mesh.triangle(tri, pts);
-      const e1 = V.sub(new Vec3(), pts[1], pts[0]);
-      const e2 = V.sub(new Vec3(), pts[2], pts[0]);
+      const e1 = V.sub(S_E1, pts[1], pts[0]);
+      const e2 = V.sub(S_E2, pts[2], pts[0]);
       V.cross(nTri, e1, e2);
       const area2 = V.length(nTri);
       if (!(area2 > 1e-12)) continue; // degenerate triangle
       V.scale(nTri, nTri, 1 / area2);
       Q.rotate(nTri, tm.q, nTri);
-      const shapeO = { shape: co.shape, transform: to };
+      const shapeO = S_PLACED_A;
+      shapeO.shape = co.shape;
       // Fast path: face-normal contact from the shape's lowest points over this triangle.
       const fast = convexTriangleContact(
         shapeO,
-        T.apply(new Vec3(), tm, pts[0]),
-        T.apply(new Vec3(), tm, pts[1]),
-        T.apply(new Vec3(), tm, pts[2]),
+        T.apply(S_W0, tm, pts[0]),
+        T.apply(S_W1, tm, pts[1]),
+        T.apply(S_W2, tm, pts[2]),
         0.5 * this.linearSlop,
       );
       if (fast === 'clear') continue;
@@ -997,9 +1131,18 @@ export class World {
       if (!old && (ca.body.awake || cb.body.awake)) this.wakePair(ca.body, cb.body);
     }
     const had = subs !== undefined && subs.size > 0;
-    if (next.size > 0) this.meshContacts.set(key, next);
-    else this.meshContacts.delete(key);
-    if (next.size > 0) this.emit({ kind: had ? 'persist' : 'begin', a: ca, b: cb });
+    const keep = next.size > 0;
+    if (keep) {
+      // `next` becomes the pair's map; the previous map, emptied, is the scratch for the next call.
+      this.meshContacts.set(key, next);
+      const spare = subs ?? new Map<number, ContactConstraint>();
+      spare.clear();
+      this.meshScratch = spare;
+    } else {
+      this.meshContacts.delete(key);
+      next.clear();
+    }
+    if (keep) this.emit({ kind: had ? 'persist' : 'begin', a: ca, b: cb });
     else if (had) this.emit({ kind: 'end', a: ca, b: cb });
   }
 
@@ -1008,10 +1151,12 @@ export class World {
       this.refreshMeshPair(key, ca, cb);
       return;
     }
-    const ta = ca.body.colliderTransform(ca, new Transform());
-    const tb = cb.body.colliderTransform(cb, new Transform());
-    const placedA = { shape: ca.shape, transform: ta };
-    const placedB = { shape: cb.shape, transform: tb };
+    ca.body.colliderTransform(ca, S_TA);
+    cb.body.colliderTransform(cb, S_TB);
+    const placedA = S_PLACED_A;
+    const placedB = S_PLACED_B;
+    placedA.shape = ca.shape;
+    placedB.shape = cb.shape;
     const m =
       manifoldOf(placedA, placedB) ??
       (this.ccdMode === 'speculative' ? this.speculative(ca, cb, placedA, placedB, dt) : null);
@@ -1042,7 +1187,10 @@ export class World {
     b.wake();
   }
 
-  /** Builds a solver constraint from a manifold, carrying impulses over from `old` by feature id. */
+  /**
+   * Builds a solver constraint from a manifold, carrying impulses over from `old` by feature id.
+   * When `old` exists its object (and point objects) are refilled in place rather than replaced.
+   */
   private makeConstraint(
     ca: Collider,
     cb: Collider,
@@ -1050,38 +1198,111 @@ export class World {
     old: ContactConstraint | undefined,
     sub: number,
   ): ContactConstraint {
-    const [t1, t2] = tangentBasis(m.normal);
-    const points: SolverPoint[] = m.points.map((p) => {
-      const prev = old?.points.find((o) => o.id === p.id);
-      return {
-        id: p.id,
-        localA: localAnchor(ca.body, p.pointA),
-        localB: localAnchor(cb.body, p.pointB),
-        rA: new Vec3(),
-        rB: new Vec3(),
-        gap: Math.max(0, -p.depth),
-        restitutionTarget: 0,
-        normalMass: 0,
-        tangentMass1: 0,
-        tangentMass2: 0,
-        impulseN: prev?.impulseN ?? 0,
-        impulseT1: prev?.impulseT1 ?? 0,
-        impulseT2: prev?.impulseT2 ?? 0,
-      };
-    });
-    return {
+    const mp = m.points;
+    const n = mp.length;
+    if (n > prevN.length) {
+      prevN = new Float64Array(2 * n);
+      prevT1 = new Float64Array(2 * n);
+      prevT2 = new Float64Array(2 * n);
+    }
+    // Read the old impulses first: the refill below overwrites the old points.
+    for (let i = 0; i < n; i++) {
+      const id = (mp[i] as { id: number }).id;
+      prevN[i] = prevT1[i] = prevT2[i] = 0;
+      if (!old) continue;
+      const op = old.points;
+      for (let j = 0; j < op.length; j++) {
+        const o = op[j] as SolverPoint;
+        if (o.id !== id) continue;
+        prevN[i] = o.impulseN;
+        prevT1[i] = o.impulseT1;
+        prevT2[i] = o.impulseT2;
+        break;
+      }
+    }
+    const pa = this.colliderProxy.get(ca) as number;
+    const pb = this.colliderProxy.get(cb) as number;
+    const c: Mutable<ContactConstraint> = old ?? {
       bodyA: ca.body,
       bodyB: cb.body,
-      normal: V.copy(new Vec3(), m.normal),
-      tangent1: t1,
-      tangent2: t2,
-      friction: Math.sqrt(ca.friction * cb.friction),
-      restitution: Math.max(ca.restitution, cb.restitution),
-      points,
-      pair: [this.colliderProxy.get(ca) as number, this.colliderProxy.get(cb) as number],
+      normal: new Vec3(),
+      tangent1: new Vec3(),
+      tangent2: new Vec3(),
+      friction: 0,
+      restitution: 0,
+      points: [],
+      pair: [pa, pb],
       sub,
       normalK: new Float64Array(0),
     };
+    c.bodyA = ca.body;
+    c.bodyB = cb.body;
+    if (old) {
+      V.copy(S_OT1, c.tangent1);
+      V.copy(S_OT2, c.tangent2);
+    }
+    V.copy(c.normal, m.normal);
+    // Same basis as `tangentBasis`.
+    V.perpendicular(c.tangent1, m.normal);
+    V.cross(c.tangent2, m.normal, c.tangent1);
+    // perpendicular() switches branch at |nx| = 0.577 and the basis then flips: carry the friction
+    // impulse over as a world-space vector instead of component-wise.
+    if (old && V.lengthSq(S_OT1) > 0.5 && V.dot(S_OT1, c.tangent1) < 0.5) {
+      for (let i = 0; i < n; i++) {
+        const a = prevT1[i] as number;
+        const b = prevT2[i] as number;
+        V.set(
+          S_DV,
+          a * S_OT1.x + b * S_OT2.x,
+          a * S_OT1.y + b * S_OT2.y,
+          a * S_OT1.z + b * S_OT2.z,
+        );
+        prevT1[i] = V.dot(S_DV, c.tangent1);
+        prevT2[i] = V.dot(S_DV, c.tangent2);
+      }
+    }
+    c.friction = Math.sqrt(ca.friction * cb.friction);
+    c.restitution = Math.max(ca.restitution, cb.restitution);
+    if (c.pair[0] !== pa || c.pair[1] !== pb) c.pair = [pa, pb];
+    c.sub = sub;
+    const pts = c.points;
+    for (let i = 0; i < n; i++) {
+      const p = mp[i] as ContactManifold['points'][number];
+      let sp = pts[i] as Mutable<SolverPoint> | undefined;
+      if (!sp) {
+        sp = {
+          id: 0,
+          localA: new Vec3(),
+          localB: new Vec3(),
+          rA: new Vec3(),
+          rB: new Vec3(),
+          gap: 0,
+          restitutionTarget: 0,
+          normalMass: 0,
+          tangentMass1: 0,
+          tangentMass2: 0,
+          impulseN: 0,
+          impulseT1: 0,
+          impulseT2: 0,
+        };
+        pts.push(sp);
+      }
+      sp.id = p.id;
+      localAnchorInto(sp.localA, ca.body, p.pointA);
+      localAnchorInto(sp.localB, cb.body, p.pointB);
+      V.set(sp.rA, 0, 0, 0);
+      V.set(sp.rB, 0, 0, 0);
+      sp.gap = Math.max(0, -p.depth);
+      sp.restitutionTarget = 0;
+      sp.normalMass = 0;
+      sp.tangentMass1 = 0;
+      sp.tangentMass2 = 0;
+      sp.impulseN = prevN[i] as number;
+      sp.impulseT1 = prevT1[i] as number;
+      sp.impulseT2 = prevT2[i] as number;
+    }
+    pts.length = n;
+    return c;
   }
 
   /**
@@ -1119,46 +1340,46 @@ export class World {
   }
 
   private emit(e: ContactEvent): void {
-    // Iterate a copy: a listener may remove itself or others.
-    for (const l of [...this.listeners]) l(e);
+    // The array is never mutated in place, so this is the "iterate a copy" a listener may rely on
+    // when it removes itself or others.
+    if (e.kind !== 'persist') {
+      const pa = this.colliderProxy.get(e.a);
+      const pb = this.colliderProxy.get(e.b);
+      if (pa !== undefined && pb !== undefined) {
+        const k = pairKey(pa, pb);
+        if (e.kind === 'begin') this.begun.set(k, { a: e.a, b: e.b });
+        else this.begun.delete(k);
+      }
+    }
+    const ls = this.listeners;
+    for (let i = 0; i < ls.length; i++) (ls[i] as (e: ContactEvent) => void)(e);
   }
 
   /** Puts islands of slow bodies to sleep, using union-find over active contacts. */
-  private updateSleep(dt: number): void {
+  private updateSleep(contacts: readonly ContactConstraint[], dt: number): void {
     // Union-find over the bodies, with the parent links stored on the bodies themselves.
-    const find = (b: RigidBody): RigidBody => {
-      let r = b;
-      while (r.islandParent !== r) {
-        r.islandParent = r.islandParent.islandParent;
-        r = r.islandParent;
-      }
-      return r;
-    };
     for (const body of this.bodies) {
       body.islandParent = body;
       body.islandMin = Infinity;
     }
     // Islands connect through dynamic bodies only: a shared static floor or anchor must not merge
     // unrelated groups.
-    const link = (a: RigidBody, b: RigidBody): void => {
-      if (!a.isDynamic || !b.isDynamic) return;
-      const ra = find(a);
-      const rb = find(b);
-      if (ra !== rb) ra.islandParent = rb;
-    };
-    this.forEachContact((c) => link(c.bodyA, c.bodyB));
-    for (const j of this.joints) link(j.bodyA, j.bodyB);
+    for (let i = 0; i < contacts.length; i++) {
+      const c = contacts[i] as ContactConstraint;
+      linkIsland(c.bodyA, c.bodyB);
+    }
+    for (const j of this.joints) linkIsland(j.bodyA, j.bodyB);
     for (const body of this.bodies) {
       if (!body.isDynamic) continue;
       const slow =
         V.lengthSq(body.linearVelocity) < 1e-4 && V.lengthSq(body.angularVelocity) < 1e-4;
       body.sleepTime = slow ? body.sleepTime + dt : 0;
-      const root = find(body);
+      const root = findIsland(body);
       root.islandMin = Math.min(root.islandMin, body.sleepTime);
     }
     for (const body of this.bodies) {
       if (!body.isDynamic || !body.awake) continue;
-      const ready = find(body).islandMin >= this.sleepTimeLimit;
+      const ready = findIsland(body).islandMin >= this.sleepTimeLimit;
       if (ready) {
         body.awake = false;
         body.linearVelocity.x = body.linearVelocity.y = body.linearVelocity.z = 0;
@@ -1168,29 +1389,53 @@ export class World {
   }
 }
 
+function findIsland(b: RigidBody): RigidBody {
+  let r = b;
+  while (r.islandParent !== r) {
+    r.islandParent = r.islandParent.islandParent;
+    r = r.islandParent;
+  }
+  return r;
+}
+
+function linkIsland(a: RigidBody, b: RigidBody): void {
+  if (!a.isDynamic || !b.isDynamic) return;
+  const ra = findIsland(a);
+  const rb = findIsland(b);
+  if (ra !== rb) ra.islandParent = rb;
+}
+
 /** Bounding box, in the frame of transform `t`, of a world-space box. */
 function toLocalBox(box: AABB, t: Transform): AABB {
-  const out = BB.empty(new AABB());
-  for (const x of [box.min.x, box.max.x]) {
-    for (const y of [box.min.y, box.max.y]) {
-      for (const z of [box.min.z, box.max.z]) {
-        BB.expandPoint(out, T.applyInverse(new Vec3(), t, new Vec3(x, y, z)));
-      }
-    }
+  return toLocalBoxInto(new AABB(), box, t);
+}
+
+/** `toLocalBox` into `out` (which must not be `box`). */
+function toLocalBoxInto(out: AABB, box: AABB, t: Transform): AABB {
+  BB.empty(out);
+  for (let i = 0; i < 8; i++) {
+    S_PT2.x = i & 4 ? box.max.x : box.min.x;
+    S_PT2.y = i & 2 ? box.max.y : box.min.y;
+    S_PT2.z = i & 1 ? box.max.z : box.min.z;
+    BB.expandPoint(out, T.applyInverse(S_PT, t, S_PT2));
   }
   return out;
 }
 
 /** World-space bounding box of a convex shape placed at `t`. */
 function placedBounds(shape: ColliderShape, t: Transform): AABB {
-  const local = shape.localBounds(new AABB());
-  const out = BB.empty(new AABB());
-  for (const x of [local.min.x, local.max.x]) {
-    for (const y of [local.min.y, local.max.y]) {
-      for (const z of [local.min.z, local.max.z]) {
-        BB.expandPoint(out, T.apply(new Vec3(), t, new Vec3(x, y, z)));
-      }
-    }
+  return placedBoundsInto(new AABB(), shape, t);
+}
+
+/** `placedBounds` into `out`. Corner order (x slowest, z fastest) matches the allocating version. */
+function placedBoundsInto(out: AABB, shape: ColliderShape, t: Transform): AABB {
+  const local = shape.localBounds(S_LB);
+  BB.empty(out);
+  for (let i = 0; i < 8; i++) {
+    S_PT2.x = i & 4 ? local.max.x : local.min.x;
+    S_PT2.y = i & 2 ? local.max.y : local.min.y;
+    S_PT2.z = i & 1 ? local.max.z : local.min.z;
+    BB.expandPoint(out, T.apply(S_PT, t, S_PT2));
   }
   return out;
 }
@@ -1208,7 +1453,11 @@ function bodyPairKey(a: RigidBody, b: RigidBody): number {
 }
 
 /** Anchor of a world point in a body's frame: the inverse rotation of (point − center of mass). */
-function localAnchor(body: RigidBody, world: Vec3): Vec3 {
-  const d = V.sub(new Vec3(), world, body.position);
-  return Q.rotateInverse(new Vec3(), body.orientation, d);
+function localAnchorInto(out: Vec3, body: RigidBody, world: Vec3): Vec3 {
+  V.sub(out, world, body.position);
+  return Q.rotateInverse(out, body.orientation, out);
+}
+
+function ascending(x: number, y: number): number {
+  return x - y;
 }

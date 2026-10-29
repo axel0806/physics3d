@@ -41,6 +41,9 @@ export interface BodyOptions {
   readonly ccd?: boolean;
 }
 
+/** Scratch for `colliderTransform` (keeps the per-collider pose update allocation-free). */
+const localOffset = new Vec3();
+
 /**
  * Rigid body. `position` is the center of mass in world space. Dynamic bodies have positive mass
  * and a local inertia tensor; static and kinematic bodies have zero inverse mass.
@@ -78,6 +81,12 @@ export class RigidBody {
   /** Scratch for sleep islands (union-find parent and the island smallest sleep timer). */
   islandParent: RigidBody = this;
   islandMin = 0;
+  /** Scratch for joint position-correction feedback (see World.step); valid when the stamp matches. */
+  readonly feedbackLinear: Vec3 = new Vec3();
+  readonly feedbackAngular: Vec3 = new Vec3();
+  feedbackStamp = 0;
+  /** Scratch: contact-touch mark, valid when it equals the current step stamp. */
+  touchStamp = 0;
   /** Number of joints attached; jointed bodies rotate after the constraint solve. */
   jointCount = 0;
   /** Sleep bookkeeping. */
@@ -233,7 +242,7 @@ export class RigidBody {
   /** Transform of a collider in world space. */
   colliderTransform(c: Collider, out: Transform): Transform {
     Q.mul(out.q, this.orientation, c.local.q);
-    const p = Q.rotate(new Vec3(), this.orientation, c.local.p);
+    const p = Q.rotate(localOffset, this.orientation, c.local.p);
     out.p.x = this.position.x + p.x;
     out.p.y = this.position.y + p.y;
     out.p.z = this.position.z + p.z;

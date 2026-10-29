@@ -220,36 +220,71 @@ export class ContactBatch {
       }
     }
     const mu = this.cFriction[k] as number;
+    const t1x = this.cTan1[3 * k] as number;
+    const t1y = this.cTan1[3 * k + 1] as number;
+    const t1z = this.cTan1[3 * k + 2] as number;
+    const t2x = this.cTan2[3 * k] as number;
+    const t2y = this.cTan2[3 * k + 1] as number;
+    const t2z = this.cTan2[3 * k + 2] as number;
+    const lin = this.lin;
+    const ang = this.ang;
+    const pI = this.pImpulse;
+    const pM = this.pMass;
+    const pRA = this.pRA;
+    const pRB = this.pRB;
     for (let q = start; q < end; q++) {
-      const maxF = mu * (this.pImpulse[3 * q] as number);
+      const acc1 = pI[3 * q + 1] as number;
+      const acc2 = pI[3 * q + 2] as number;
+      const maxF = mu * (pI[3 * q] as number);
+      // No normal load and nothing accumulated: the clamped impulse is exactly zero.
+      if (maxF === 0 && acc1 === 0 && acc2 === 0) continue;
+      const m1 = pM[3 * q + 1] as number;
+      const m2 = pM[3 * q + 2] as number;
+      const rx = pRA[3 * q] as number;
+      const ry = pRA[3 * q + 1] as number;
+      const rz = pRA[3 * q + 2] as number;
+      const sx = pRB[3 * q] as number;
+      const sy = pRB[3 * q + 1] as number;
+      const sz = pRB[3 * q + 2] as number;
+      // Relative velocity of the point once, then both tangent speeds from it.
+      const wax = ang[3 * a] as number;
+      const way = ang[3 * a + 1] as number;
+      const waz = ang[3 * a + 2] as number;
+      const wbx = ang[3 * b] as number;
+      const wby = ang[3 * b + 1] as number;
+      const wbz = ang[3 * b + 2] as number;
+      const vx =
+        (lin[3 * b] as number) +
+        (wby * sz - wbz * sy) -
+        (lin[3 * a] as number) -
+        (way * rz - waz * ry);
+      const vy =
+        (lin[3 * b + 1] as number) +
+        (wbz * sx - wbx * sz) -
+        (lin[3 * a + 1] as number) -
+        (waz * rx - wax * rz);
+      const vz =
+        (lin[3 * b + 2] as number) +
+        (wbx * sy - wby * sx) -
+        (lin[3 * a + 2] as number) -
+        (wax * ry - way * rx);
       // Both tangent velocities are cancelled together, then the 2D impulse is bounded by the
       // Coulomb cone (norm <= mu N), so friction is isotropic.
-      const t1 = this.cTan1;
-      const t2 = this.cTan2;
-      const t1x = t1[3 * k] as number;
-      const t1y = t1[3 * k + 1] as number;
-      const t1z = t1[3 * k + 2] as number;
-      const t2x = t2[3 * k] as number;
-      const t2y = t2[3 * k + 1] as number;
-      const t2z = t2[3 * k + 2] as number;
-      const m1 = this.pMass[3 * q + 1] as number;
-      const m2 = this.pMass[3 * q + 2] as number;
-      const acc1 = this.pImpulse[3 * q + 1] as number;
-      const acc2 = this.pImpulse[3 * q + 2] as number;
-      let n1 = acc1 - this.speedAlong(a, b, q, t1x, t1y, t1z) * m1;
-      let n2 = acc2 - this.speedAlong(a, b, q, t2x, t2y, t2z) * m2;
+      let n1 = acc1 - (vx * t1x + vy * t1y + vz * t1z) * m1;
+      let n2 = acc2 - (vx * t2x + vy * t2y + vz * t2z) * m2;
       const lenSq = n1 * n1 + n2 * n2;
       if (lenSq > maxF * maxF) {
-        const s = maxF / Math.sqrt(lenSq);
-        n1 *= s;
-        n2 *= s;
+        const sc = maxF / Math.sqrt(lenSq);
+        n1 *= sc;
+        n2 *= sc;
       }
       const d1 = n1 - acc1;
       const d2 = n2 - acc2;
+      if (d1 === 0 && d2 === 0) continue;
       if (m1 > 0) this.track(Math.abs(d1) / m1);
       if (m2 > 0) this.track(Math.abs(d2) / m2);
-      this.pImpulse[3 * q + 1] = n1;
-      this.pImpulse[3 * q + 2] = n2;
+      pI[3 * q + 1] = n1;
+      pI[3 * q + 2] = n2;
       this.applyPair(a, b, q, t1x * d1 + t2x * d2, t1y * d1 + t2y * d2, t1z * d1 + t2z * d2);
     }
   }
@@ -404,18 +439,31 @@ export class ContactBatch {
         if (w < -1e-9) feasible = false;
       }
       if (!feasible) continue;
-      for (let i = 0; i < n; i++) {
-        const q = start + i;
-        const lam = BL[i] as number;
-        const d = lam - (this.pImpulse[3 * q] as number);
-        this.pImpulse[3 * q] = lam;
-        const mass = this.pMass[3 * q] as number;
-        if (mass > 0) this.track(Math.abs(d) / mass);
-        this.applyPair(a, b, q, nx * d, ny * d, nz * d);
-      }
+      this.applyBlock(a, b, nx, ny, nz, start, n);
       return true;
     }
     return false;
+  }
+
+  /** Applies the block solution in BL as incremental normal impulses. */
+  private applyBlock(
+    a: number,
+    b: number,
+    nx: number,
+    ny: number,
+    nz: number,
+    start: number,
+    n: number,
+  ): void {
+    for (let i = 0; i < n; i++) {
+      const q = start + i;
+      const lam = BL[i] as number;
+      const d = lam - (this.pImpulse[3 * q] as number);
+      this.pImpulse[3 * q] = lam;
+      const mass = this.pMass[3 * q] as number;
+      if (mass > 0) this.track(Math.abs(d) / mass);
+      this.applyPair(a, b, q, nx * d, ny * d, nz * d);
+    }
   }
 
   /** Writes velocities back to the bodies and impulses back to the constraint points. */

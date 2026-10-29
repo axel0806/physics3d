@@ -104,9 +104,11 @@ const near = world.overlap(new Box(1, 1, 1), new Transform(center)); // Collider
 ## Events
 
 ```ts
-world.onContact((e) => console.log(e.kind, e.a.body.id, e.b.body.id)); // 'begin' | 'persist' | 'end'
-world.removeContactListener(listener);
+const off = world.onContact((e) => console.log(e.kind, e.a.body.id, e.b.body.id)); // 'begin' | 'persist' | 'end'
+off(); // unsubscribe; world.removeContactListener(listener) still works with the function you passed
 ```
+
+`restore()` emits `end` for every pair that had begun and is absent from the restored contact set.
 
 ## Snapshots and hashing
 

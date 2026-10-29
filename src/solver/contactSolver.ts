@@ -227,24 +227,39 @@ export function solveVelocity(c: ContactConstraint): void {
       applyPair(c, p, n.x * dn, n.y * dn, n.z * dn);
     }
   }
+  const t1 = c.tangent1;
+  const t2 = c.tangent2;
+  const A = c.bodyA;
+  const B = c.bodyB;
+  const la = A.linearVelocity;
+  const wa = A.angularVelocity;
+  const lb = B.linearVelocity;
+  const wb = B.angularVelocity;
   for (const p of c.points) {
     const maxF = c.friction * p.impulseN;
+    const acc1 = p.impulseT1;
+    const acc2 = p.impulseT2;
+    // No normal load and nothing accumulated: the clamped impulse is exactly zero.
+    if (maxF === 0 && acc1 === 0 && acc2 === 0) continue;
+    // Relative velocity of the point once, then both tangent speeds from it.
+    const r = p.rA;
+    const s = p.rB;
+    const vx = lb.x + (wb.y * s.z - wb.z * s.y) - la.x - (wa.y * r.z - wa.z * r.y);
+    const vy = lb.y + (wb.z * s.x - wb.x * s.z) - la.y - (wa.z * r.x - wa.x * r.z);
+    const vz = lb.z + (wb.x * s.y - wb.y * s.x) - la.z - (wa.x * r.y - wa.y * r.x);
     // Both tangent velocities are cancelled together, then the 2D impulse is bounded by the
     // Coulomb cone (norm <= mu N), so friction is isotropic.
-    const t1 = c.tangent1;
-    const t2 = c.tangent2;
-    const v1 = relativeSpeed(c, p, t1.x, t1.y, t1.z);
-    const v2 = relativeSpeed(c, p, t2.x, t2.y, t2.z);
-    let n1 = p.impulseT1 - v1 * p.tangentMass1;
-    let n2 = p.impulseT2 - v2 * p.tangentMass2;
+    let n1 = acc1 - (vx * t1.x + vy * t1.y + vz * t1.z) * p.tangentMass1;
+    let n2 = acc2 - (vx * t2.x + vy * t2.y + vz * t2.z) * p.tangentMass2;
     const lenSq = n1 * n1 + n2 * n2;
     if (lenSq > maxF * maxF) {
       const k = maxF / Math.sqrt(lenSq);
       n1 *= k;
       n2 *= k;
     }
-    const d1 = n1 - p.impulseT1;
-    const d2 = n2 - p.impulseT2;
+    const d1 = n1 - acc1;
+    const d2 = n2 - acc2;
+    if (d1 === 0 && d2 === 0) continue;
     p.impulseT1 = n1;
     p.impulseT2 = n2;
     applyPair(c, p, t1.x * d1 + t2.x * d2, t1.y * d1 + t2.y * d2, t1.z * d1 + t2.z * d2);

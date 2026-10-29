@@ -6,6 +6,21 @@ import type { RigidBody } from './body';
 
 const GYRO_ITERATIONS = 60;
 
+// Module-level temporaries: the step loop must not allocate (PLAN rule 8). Single-threaded and
+// non-reentrant, so sharing them between calls is safe.
+const rot = new Mat3();
+const rotT = new Mat3();
+const wBody = new Vec3();
+const L0 = new Vec3();
+const next = new Vec3();
+const mid = new Vec3();
+const Lmid = new Vec3();
+const gyro = new Vec3();
+const tmp = new Vec3();
+const wStart = new Vec3();
+const wEnd = new Vec3();
+const dq = new Quat();
+
 /**
  * Semi-implicit (symplectic) Euler for a rigid body. Velocities first, then poses.
  *
@@ -20,19 +35,18 @@ export function integrateVelocities(body: RigidBody, gravity: Vec3, dt: number):
   V.addScaled(v, v, gravity, body.gravityScale * dt);
   V.scale(v, v, Math.max(0, 1 - body.linearDamping * dt));
 
-  const rot = new Mat3();
   M3.fromQuat(rot, body.orientation);
-  const wBody = M3.mulVec(new Vec3(), rot.transpose(), body.angularVelocity);
+  M3.mulVec(wBody, M3.transpose(rotT, rot), body.angularVelocity);
   const I = body.localInertia;
-  const L0 = M3.mulVec(new Vec3(), I, wBody);
+  M3.mulVec(L0, I, wBody);
   // Implicit midpoint: L_{n+1} − L_n = dt · (L_mid × ω_mid). Dotting with ω_mid and with L_mid
   // gives exact conservation of ω·Iω and |L| for torque-free bodies.
-  let next = V.copy(new Vec3(), wBody);
+  V.copy(next, wBody);
   for (let k = 0; k < GYRO_ITERATIONS; k++) {
-    const mid = V.lerp(new Vec3(), wBody, next, 0.5);
-    const Lmid = M3.mulVec(new Vec3(), I, mid);
-    const gyro = V.cross(new Vec3(), Lmid, mid);
-    next = M3.mulVec(new Vec3(), body.localInvInertia, V.addScaled(new Vec3(), L0, gyro, dt));
+    V.lerp(mid, wBody, next, 0.5);
+    M3.mulVec(Lmid, I, mid);
+    V.cross(gyro, Lmid, mid);
+    M3.mulVec(next, body.localInvInertia, V.addScaled(tmp, L0, gyro, dt));
   }
   const w = M3.mulVec(body.angularVelocity, rot, next);
   V.scale(w, w, Math.max(0, 1 - body.angularDamping * dt));
@@ -48,23 +62,21 @@ export function integrateVelocities(body: RigidBody, gravity: Vec3, dt: number):
  */
 export function integrateOrientation(body: RigidBody, dt: number): void {
   if (!body.isSimulated) return;
-  const rot = new Mat3();
   M3.fromQuat(rot, body.orientation);
-  const rt = rot.transpose();
-  const wStart = M3.mulVec(new Vec3(), rt, body.stepStartAngular);
-  const wEnd = M3.mulVec(new Vec3(), rt, body.angularVelocity);
-  const mid = V.lerp(new Vec3(), wStart, wEnd, 0.5);
+  const rt = M3.transpose(rotT, rot);
+  M3.mulVec(wStart, rt, body.stepStartAngular);
+  M3.mulVec(wEnd, rt, body.angularVelocity);
+  V.lerp(mid, wStart, wEnd, 0.5);
   const speed = V.length(mid);
   if (speed > 0) {
     const half = 0.5 * speed * dt;
     const s = Math.sin(half) / speed;
-    const dq = new Quat(mid.x * s, mid.y * s, mid.z * s, Math.cos(half));
+    Q.set(dq, mid.x * s, mid.y * s, mid.z * s, Math.cos(half));
     Q.mul(body.orientation, body.orientation, dq);
     Q.normalize(body.orientation, body.orientation);
   }
-  const rotNew = new Mat3();
-  M3.fromQuat(rotNew, body.orientation);
-  M3.mulVec(body.angularVelocity, rotNew, wEnd);
+  M3.fromQuat(rot, body.orientation);
+  M3.mulVec(body.angularVelocity, rot, wEnd);
   body.updateWorldInertia();
 }
 
@@ -89,7 +101,7 @@ export function integrateOrientationPostSolve(body: RigidBody, dt: number): void
   if (speed > 0) {
     const half = 0.5 * speed * dt;
     const s = Math.sin(half) / speed;
-    const dq = new Quat(w.x * s, w.y * s, w.z * s, Math.cos(half));
+    Q.set(dq, w.x * s, w.y * s, w.z * s, Math.cos(half));
     Q.mul(body.orientation, dq, body.orientation);
     Q.normalize(body.orientation, body.orientation);
   }

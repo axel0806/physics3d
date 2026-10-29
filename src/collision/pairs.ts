@@ -4,7 +4,13 @@ import * as T from '../math/transform';
 import { Box, Capsule, Sphere } from '../shapes';
 import type { ConvexShape } from '../shapes/shape';
 import { collideConvex, type Placed } from './narrowphase';
-import { boxBoxManifold, orientedBox, type OrientedBox } from './narrowphase/sat';
+import {
+  boxBoxManifold,
+  createOrientedBox,
+  orientedBox,
+  orientedBoxInto,
+  type OrientedBox,
+} from './narrowphase/sat';
 import { capsuleCapsule, sphereBox, sphereSphere } from './narrowphase/analytic';
 import type { ContactManifold } from './narrowphase/contact';
 
@@ -13,6 +19,9 @@ export interface WorldShape {
   readonly shape: ConvexShape;
   readonly transform: Transform;
 }
+
+const POOL_A = createOrientedBox();
+const POOL_B = createOrientedBox();
 
 /** Capsule core segment in world space. */
 function segment(c: Capsule, t: Transform): [Vec3, Vec3] {
@@ -52,7 +61,10 @@ export function manifoldOf(A: WorldShape, B: WorldShape): ContactManifold | null
     return m ? swapManifold(m) : null;
   }
   if (a instanceof Box && b instanceof Box) {
-    return boxBoxManifold(orientedBox(a, A.transform), orientedBox(b, B.transform));
+    return boxBoxManifold(
+      orientedBoxInto(POOL_A, a, A.transform),
+      orientedBoxInto(POOL_B, b, B.transform),
+    );
   }
   if (a instanceof Capsule && b instanceof Capsule) {
     const [pa, qa] = segment(a, A.transform);
