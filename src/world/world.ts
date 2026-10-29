@@ -612,15 +612,17 @@ export class World {
     // Worlds without joints iterate on flat arrays (ContactBatch). Joints are solved on the
     // bodies directly, interleaved with the contacts, so jointed worlds keep the object solver.
     const batched = this.joints.length === 0;
-    for (const c of ordered) {
-      if (!this.constraintActive(c)) continue;
-      prepareContact(c, this.restitutionThreshold, dt);
-      buildNormalK(c);
-      if (!batched) warmStart(c);
+    if (!batched) {
+      for (const c of ordered) {
+        if (!this.constraintActive(c)) continue;
+        prepareContact(c, this.restitutionThreshold, dt);
+        buildNormalK(c);
+        warmStart(c);
+      }
     }
     if (batched) {
       const batch = this.batch;
-      batch.gather(ordered);
+      batch.prepare(ordered, this.restitutionThreshold, dt);
       batch.warmStart();
       // A resting pile with warm starting converges in a handful of iterations; the rest would
       // change nothing. Joints do not report convergence, so jointed worlds run every iteration.
@@ -649,8 +651,13 @@ export class World {
     }
     this.lap('integrate');
     const feedback = new Map<RigidBody, [Vec3, Vec3]>();
+    // Contact position passes run on the batch arrays (poses are unchanged by them except positions).
+    if (batched) {
+      const passes = Math.min(this.contactPositionIterations, this.positionIterations);
+      this.batch.solvePositions(passes, this.baumgarte, this.linearSlop);
+    }
     for (let it = 0; it < this.positionIterations; it++) {
-      if (it < this.contactPositionIterations) {
+      if (it < this.contactPositionIterations && !batched) {
         for (const c of ordered) {
           if (this.constraintActive(c)) solvePosition(c, this.baumgarte, this.linearSlop);
         }
